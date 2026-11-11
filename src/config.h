@@ -115,8 +115,11 @@
 /* Maximum rectangular texture size - GL_NV_texture_rectangle */
 #define MAX_TEXTURE_RECT_SIZE 2048
 
-/* Number of texture units - GL_ARB_multitexture */
-#define MAX_TEXTURE_UNITS 8
+/* Number of texture units - GL_ARB_multitexture
+ * NOVA: was 8. Fewer units means smaller span/vertex structures and shorter
+ * per-unit loops in triangle setup and state validation.
+ */
+#define MAX_TEXTURE_UNITS 4
 
 /* Maximum viewport/image size: */
 #define MAX_WIDTH 2048
