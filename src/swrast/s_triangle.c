@@ -910,6 +910,503 @@ static void persp_textured_triangle( GLcontext *ctx,
                 
 
 
+#if CHAN_BITS == 8
+
+/*
+ * NOVA: integer fast path for the classic "texture x lightmap" case.
+ *
+ * Stock swrast sends every multitextured triangle down
+ * multitextured_triangle() -> _mesa_write_texture_span(), which for each
+ * pixel of each unit does a float divide (plus four more and a log2 when
+ * mipmapping), converts the texcoords back to integers, and fetches every
+ * texel through img->FetchTexel.  A bilinear lightmap alone is four indirect
+ * calls and four float->int conversions per pixel.  That is the path Quake
+ * engines hit for the whole world, and on a 68k FPU it is brutal.
+ *
+ * This path handles exactly two enabled 2D units:
+ *
+ *   unit 0:  RGB or RGBA texture, GL_REPLACE
+ *   unit 1:  RGB texture, GL_MODULATE or GL_COMBINE(MODULATE, PREVIOUS,
+ *            TEXTURE) with an RGB scale of 1, 2 or 4
+ *
+ * both GL_REPEAT, no border, filtered GL_NEAREST, GL_LINEAR or the matching
+ * *_MIPMAP_NEAREST mode.  Anything else still takes the general path.
+ *
+ * Texture coordinates are perspective-divided every DUALTEX_SUBDIV pixels and
+ * interpolated linearly in fixed point in between (the same trick Quake's own
+ * software renderer uses), so the per-pixel work is integer only.  The mipmap
+ * level is likewise chosen once per sub-span rather than per pixel.
+ *
+ * Fog, alpha test, depth test, blending and masking are still done by
+ * _mesa_write_rgba_span(), so those all keep working.
+ */
+
+#define DUALTEX_SUBDIV       16
+#define DUALTEX_SUBDIV_SHIFT 4
+
+struct dualtex_unit
+{
+   const struct gl_texture_object *obj;
+   GLint comps;              /* bytes per texel: 3 (RGB) or 4 (RGBA) */
+   GLint linear;             /* bilinear filtering, else nearest */
+   GLint maxLevel;           /* highest usable mip level relative to BaseLevel;
+                              * zero when not mipmapping */
+   GLfloat width, height;    /* size of the base level, in texels */
+};
+
+struct dualtex_info
+{
+   struct dualtex_unit unit[2];
+   GLint rgbShift;           /* unit 1 GL_RGB_SCALE as a shift: 0, 1 or 2 */
+   GLboolean zReject;        /* can spans be pre-tested against the Z buffer? */
+};
+
+
+/*
+ * Can the given texture object be sampled by dualtex_span()?
+ */
+static GLboolean
+dualtex_texture_ok( const struct gl_texture_unit *unit, GLboolean allowAlpha )
+{
+   const struct gl_texture_object *obj = unit->_Current;
+   const struct gl_texture_image *base;
+   GLint format, level, lastLevel;
+
+   if (!obj || !obj->Complete || obj != unit->Current2D)
+      return GL_FALSE;
+   if (obj->WrapS != GL_REPEAT || obj->WrapT != GL_REPEAT)
+      return GL_FALSE;
+
+   lastLevel = obj->BaseLevel;
+   if (obj->MinFilter == obj->MagFilter) {
+      if (obj->MinFilter != GL_NEAREST && obj->MinFilter != GL_LINEAR)
+         return GL_FALSE;
+   }
+   else if ((obj->MinFilter == GL_NEAREST_MIPMAP_NEAREST
+             && obj->MagFilter == GL_NEAREST) ||
+            (obj->MinFilter == GL_LINEAR_MIPMAP_NEAREST
+             && obj->MagFilter == GL_LINEAR)) {
+      if (unit->LodBias != 0.0F
+          || obj->MinLod != -1000.0F || obj->MaxLod != 1000.0F)
+         return GL_FALSE;
+      lastLevel = obj->_MaxLevel;
+   }
+   else {
+      /* trilinear, or min/mag filters that disagree: general path */
+      return GL_FALSE;
+   }
+
+   base = obj->Image[obj->BaseLevel];
+   if (!base)
+      return GL_FALSE;
+   format = base->TexFormat->MesaFormat;
+   if (format != MESA_FORMAT_RGB && !(allowAlpha && format == MESA_FORMAT_RGBA))
+      return GL_FALSE;
+
+   for (level = obj->BaseLevel; level <= lastLevel; level++) {
+      const struct gl_texture_image *img = obj->Image[level];
+      if (!img || !img->Data || img->Border != 0
+          || img->Width != img->RowStride
+          || img->TexFormat->MesaFormat != format)
+         return GL_FALSE;
+   }
+   return GL_TRUE;
+}
+
+
+/*
+ * Is the current state one that dualtex_triangle() can render?
+ */
+static GLboolean
+dualtex_usable( const GLcontext *ctx )
+{
+   const struct gl_texture_unit *unit0 = &ctx->Texture.Unit[0];
+   const struct gl_texture_unit *unit1 = &ctx->Texture.Unit[1];
+
+   if (ctx->Texture._EnabledUnits != 0x3
+       || unit0->_ReallyEnabled != TEXTURE_2D_BIT
+       || unit1->_ReallyEnabled != TEXTURE_2D_BIT
+       || ctx->Light.Model.ColorControl != GL_SINGLE_COLOR
+       || ctx->Fog.ColorSumEnabled)
+      return GL_FALSE;
+
+   if (unit0->EnvMode != GL_REPLACE)
+      return GL_FALSE;
+
+   if (unit1->EnvMode == GL_COMBINE_EXT) {
+      /* RGB = PREVIOUS * TEXTURE * scale */
+      if (unit1->CombineModeRGB != GL_MODULATE
+          || unit1->CombineOperandRGB[0] != GL_SRC_COLOR
+          || unit1->CombineOperandRGB[1] != GL_SRC_COLOR
+          || unit1->CombineScaleShiftRGB > 2)
+         return GL_FALSE;
+      if (!((unit1->CombineSourceRGB[0] == GL_PREVIOUS_EXT
+             && unit1->CombineSourceRGB[1] == GL_TEXTURE) ||
+            (unit1->CombineSourceRGB[0] == GL_TEXTURE
+             && unit1->CombineSourceRGB[1] == GL_PREVIOUS_EXT)))
+         return GL_FALSE;
+      /* Alpha must come out as the incoming alpha.  Unit 1 is an RGB
+       * texture (alpha = 1), so PREVIOUS * TEXTURE does that too.
+       */
+      if (unit1->CombineScaleShiftA != 0)
+         return GL_FALSE;
+      if (unit1->CombineModeA == GL_REPLACE) {
+         if (unit1->CombineSourceA[0] != GL_PREVIOUS_EXT
+             || unit1->CombineOperandA[0] != GL_SRC_ALPHA)
+            return GL_FALSE;
+      }
+      else if (unit1->CombineModeA == GL_MODULATE) {
+         if (unit1->CombineOperandA[0] != GL_SRC_ALPHA
+             || unit1->CombineOperandA[1] != GL_SRC_ALPHA)
+            return GL_FALSE;
+         if (!((unit1->CombineSourceA[0] == GL_PREVIOUS_EXT
+                && unit1->CombineSourceA[1] == GL_TEXTURE) ||
+               (unit1->CombineSourceA[0] == GL_TEXTURE
+                && unit1->CombineSourceA[1] == GL_PREVIOUS_EXT)))
+            return GL_FALSE;
+      }
+      else {
+         return GL_FALSE;
+      }
+   }
+   else if (unit1->EnvMode != GL_MODULATE) {
+      return GL_FALSE;
+   }
+
+   return dualtex_texture_ok(unit0, GL_TRUE)
+       && dualtex_texture_ok(unit1, GL_FALSE);
+}
+
+
+/*
+ * Per-triangle setup.  Returns GL_FALSE if there is nothing to draw with.
+ */
+static GLboolean
+dualtex_setup( const GLcontext *ctx, struct dualtex_info *info )
+{
+   const SWcontext *swrast = SWRAST_CONTEXT(ctx);
+   const struct gl_texture_unit *unit1 = &ctx->Texture.Unit[1];
+   GLuint u;
+
+   for (u = 0; u < 2; u++) {
+      const struct gl_texture_object *obj = ctx->Texture.Unit[u]._Current;
+      const struct gl_texture_image *img = obj->Image[obj->BaseLevel];
+      struct dualtex_unit *du = &info->unit[u];
+      if (!img->Data)
+         return GL_FALSE;       /* this shouldn't happen */
+      du->obj = obj;
+      du->comps = (img->TexFormat->MesaFormat == MESA_FORMAT_RGBA) ? 4 : 3;
+      du->linear = (obj->MagFilter == GL_LINEAR);
+      du->maxLevel = (obj->MinFilter == obj->MagFilter)
+                   ? 0 : (obj->_MaxLevel - obj->BaseLevel);
+      du->width = (GLfloat) img->Width;
+      du->height = (GLfloat) img->Height;
+   }
+
+   info->rgbShift = (unit1->EnvMode == GL_COMBINE_EXT)
+                  ? (GLint) unit1->CombineScaleShiftRGB : 0;
+
+   /* A span that fails the depth test everywhere can be thrown away before
+    * it is textured, provided nothing else (stencil, clipping) depends on it
+    * and we can look at the depth buffer directly.
+    */
+   info->zReject = (ctx->Depth.Test
+                    && (ctx->Depth.Func == GL_LESS
+                        || ctx->Depth.Func == GL_LEQUAL)
+                    && ctx->Visual.depthBits <= 16
+                    && ctx->DrawBuffer->DepthBuffer
+                    && !swrast->Driver.ReadDepthSpan
+                    && !ctx->Stencil.Enabled
+                    && !(swrast->_RasterMask & CLIP_BIT));
+   return GL_TRUE;
+}
+
+
+/*
+ * Would every fragment of this span fail the depth test?
+ * Mirrors _mesa_span_interpolate_z() + depth_test_span16(), without writing.
+ */
+static INLINE GLboolean
+dualtex_span_hidden( const GLcontext *ctx, const struct sw_span *span )
+{
+   const GLushort *zbuf = (const GLushort *) ctx->DrawBuffer->DepthBuffer
+                        + ctx->DrawBuffer->Width * span->y + span->x;
+   const GLfixed zStep = span->zStep;
+   GLfixed z = span->z;
+   GLuint i;
+
+   if (ctx->Depth.Func == GL_LESS) {
+      for (i = 0; i < span->end; i++) {
+         if ((GLdepth) FixedToInt(z) < (GLdepth) zbuf[i])
+            return GL_FALSE;
+         z += zStep;
+      }
+   }
+   else {
+      for (i = 0; i < span->end; i++) {
+         if ((GLdepth) FixedToInt(z) <= (GLdepth) zbuf[i])
+            return GL_FALSE;
+         z += zStep;
+      }
+   }
+   return GL_TRUE;
+}
+
+
+/* a + (b - a) * f, with f in [0,255] */
+#define DUALTEX_LERP(a, b, f) \
+   ((GLint) (a) + ((((GLint) (b) - (GLint) (a)) * (f)) >> 8))
+
+/* Point at the nearest texel of unit U. */
+#define DUALTEX_NEAREST(U, TEX)						\
+   const GLchan *TEX = data##U + comps##U *				\
+      (((FixedToInt(t##U) & hmask##U) << wlog##U)			\
+       + (FixedToInt(s##U) & wmask##U))
+
+/* Bilinearly filter unit U into a local texel. */
+#define DUALTEX_LINEAR(U, TEX)						\
+   GLchan TEX[4];							\
+   {									\
+      const GLint col0 = FixedToInt(s##U) & wmask##U;			\
+      const GLint col1 = (col0 + 1) & wmask##U;				\
+      const GLint row0 = (FixedToInt(t##U) & hmask##U) << wlog##U;	\
+      const GLint row1 = ((FixedToInt(t##U) + 1) & hmask##U) << wlog##U;\
+      const GLint fs = (s##U & FIXED_FRAC_MASK) >> (FIXED_SHIFT - 8);	\
+      const GLint ft = (t##U & FIXED_FRAC_MASK) >> (FIXED_SHIFT - 8);	\
+      const GLchan *t00 = data##U + comps##U * (row0 + col0);		\
+      const GLchan *t01 = data##U + comps##U * (row0 + col1);		\
+      const GLchan *t10 = data##U + comps##U * (row1 + col0);		\
+      const GLchan *t11 = data##U + comps##U * (row1 + col1);		\
+      GLint top, bot;							\
+      top = DUALTEX_LERP(t00[0], t01[0], fs);				\
+      bot = DUALTEX_LERP(t10[0], t11[0], fs);				\
+      TEX[0] = (GLchan) DUALTEX_LERP(top, bot, ft);			\
+      top = DUALTEX_LERP(t00[1], t01[1], fs);				\
+      bot = DUALTEX_LERP(t10[1], t11[1], fs);				\
+      TEX[1] = (GLchan) DUALTEX_LERP(top, bot, ft);			\
+      top = DUALTEX_LERP(t00[2], t01[2], fs);				\
+      bot = DUALTEX_LERP(t10[2], t11[2], fs);				\
+      TEX[2] = (GLchan) DUALTEX_LERP(top, bot, ft);			\
+      if (comps##U == 4) {						\
+         top = DUALTEX_LERP(t00[3], t01[3], fs);			\
+         bot = DUALTEX_LERP(t10[3], t11[3], fs);			\
+         TEX[3] = (GLchan) DUALTEX_LERP(top, bot, ft);			\
+      }									\
+   }
+
+/* One sub-span: sample both units, modulate, store. */
+#define DUALTEX_LOOP(FETCH0, FETCH1)					\
+   for (i = 0; i < n; i++) {						\
+      FETCH0(0, tex0);							\
+      FETCH1(1, tex1);							\
+      GLuint r = ((GLuint) tex0[0] * ((GLuint) tex1[0] + 1)) >> shift;	\
+      GLuint g = ((GLuint) tex0[1] * ((GLuint) tex1[1] + 1)) >> shift;	\
+      GLuint b = ((GLuint) tex0[2] * ((GLuint) tex1[2] + 1)) >> shift;	\
+      if (shift != 8) {							\
+         if (r > CHAN_MAX) r = CHAN_MAX;				\
+         if (g > CHAN_MAX) g = CHAN_MAX;				\
+         if (b > CHAN_MAX) b = CHAN_MAX;				\
+      }									\
+      dest[RCOMP] = (GLchan) r;						\
+      dest[GCOMP] = (GLchan) g;						\
+      dest[BCOMP] = (GLchan) b;						\
+      dest[ACOMP] = (comps0 == 4) ? tex0[3]				\
+                                  : (GLchan) FixedToInt(alpha);		\
+      alpha += alphaStep;						\
+      s0 += ds0;  t0 += dt0;						\
+      s1 += ds1;  t1 += dt1;						\
+      dest += 4;							\
+   }
+
+
+static void
+dualtex_span( GLcontext *ctx, struct sw_span *span,
+              const struct dualtex_info *info )
+{
+   /* homogeneous texcoords, pre-scaled so that s/q is in base-level texels */
+   GLfloat hs[2], ht[2], hq[2];          /* at the start of the sub-span */
+   GLfloat hsStep[2], htStep[2], hqStep[2];
+   GLfloat sBias[2], tBias[2];           /* whole repeats removed, see below */
+   GLfloat sTex[2], tTex[2], invQ[2];    /* divided values, start of sub-span */
+   GLfixed sFix[2], tFix[2];
+   GLchan *dest = span->array->rgba[0];
+   const GLint shift = 8 - info->rgbShift;
+   const GLfixed alphaStep = span->alphaStep;
+   GLfixed alpha = span->alpha;
+   GLuint left = span->end;
+   GLuint u;
+
+   if (info->zReject && dualtex_span_hidden(ctx, span))
+      return;
+
+   for (u = 0; u < 2; u++) {
+      const struct dualtex_unit *du = &info->unit[u];
+      hs[u] = span->tex[u][0] * du->width;
+      ht[u] = span->tex[u][1] * du->height;
+      hq[u] = span->tex[u][3];
+      hsStep[u] = span->texStepX[u][0] * du->width;
+      htStep[u] = span->texStepX[u][1] * du->height;
+      hqStep[u] = span->texStepX[u][3];
+
+      invQ[u] = (hq[u] == 0.0F) ? 1.0F : (1.0F / hq[u]);
+      sTex[u] = hs[u] * invQ[u];
+      tTex[u] = ht[u] * invQ[u];
+
+      /* The texture repeats, so drop the whole repeats at the left end of
+       * the span.  That keeps the fixed-point coordinates small however far
+       * from the texture origin the polygon is.
+       */
+      sBias[u] = (GLfloat) IFLOOR(sTex[u] / du->width) * du->width;
+      tBias[u] = (GLfloat) IFLOOR(tTex[u] / du->height) * du->height;
+      sFix[u] = (GLfixed) ((sTex[u] - sBias[u]) * FIXED_SCALE);
+      tFix[u] = (GLfixed) ((tTex[u] - tBias[u]) * FIXED_SCALE);
+   }
+
+   while (left > 0) {
+      const GLuint n = (left > DUALTEX_SUBDIV) ? DUALTEX_SUBDIV : left;
+      const struct gl_texture_image *img[2];
+      GLint level[2];
+      GLfixed sStep[2], tStep[2];
+      GLuint i;
+
+      for (u = 0; u < 2; u++) {
+         const struct dualtex_unit *du = &info->unit[u];
+         GLfixed sEnd, tEnd;
+
+         /* Mipmap level for this sub-span, from the texel footprint of a
+          * pixel at its left end.  Same quantity compute_lambda() takes the
+          * log2 of, but level k is simply rho in (2^(k-0.5), 2^(k+0.5)].
+          */
+         level[u] = 0;
+         if (du->maxLevel > 0) {
+            const GLfloat dudx = FABSF((hsStep[u] - sTex[u] * hqStep[u]) * invQ[u]);
+            const GLfloat dvdx = FABSF((htStep[u] - tTex[u] * hqStep[u]) * invQ[u]);
+            const GLfloat dudy = FABSF((span->texStepY[u][0] * du->width
+                                        - sTex[u] * span->texStepY[u][3]) * invQ[u]);
+            const GLfloat dvdy = FABSF((span->texStepY[u][1] * du->height
+                                        - tTex[u] * span->texStepY[u][3]) * invQ[u]);
+            const GLfloat maxU = MAX2(dudx, dudy);
+            const GLfloat maxV = MAX2(dvdx, dvdy);
+            const GLfloat rho = MAX2(maxU, maxV);
+            GLfloat threshold = 1.41421356F;
+            while (level[u] < du->maxLevel && rho > threshold) {
+               level[u]++;
+               threshold *= 2.0F;
+            }
+         }
+         img[u] = du->obj->Image[du->obj->BaseLevel + level[u]];
+
+         /* perspective-correct coordinates at the right end of the sub-span */
+         hs[u] += hsStep[u] * (GLfloat) n;
+         ht[u] += htStep[u] * (GLfloat) n;
+         hq[u] += hqStep[u] * (GLfloat) n;
+         invQ[u] = (hq[u] == 0.0F) ? 1.0F : (1.0F / hq[u]);
+         sTex[u] = hs[u] * invQ[u];
+         tTex[u] = ht[u] * invQ[u];
+         sEnd = (GLfixed) ((sTex[u] - sBias[u]) * FIXED_SCALE);
+         tEnd = (GLfixed) ((tTex[u] - tBias[u]) * FIXED_SCALE);
+
+         if (n == DUALTEX_SUBDIV) {
+            sStep[u] = (sEnd - sFix[u]) >> DUALTEX_SUBDIV_SHIFT;
+            tStep[u] = (tEnd - tFix[u]) >> DUALTEX_SUBDIV_SHIFT;
+         }
+         else {
+            sStep[u] = (sEnd - sFix[u]) / (GLint) n;
+            tStep[u] = (tEnd - tFix[u]) / (GLint) n;
+         }
+      }
+
+      {
+         /* Everything the inner loop needs, in locals.  Coordinates are
+          * moved to the chosen mip level, and bilinear sampling is centred
+          * by the usual half-texel offset.
+          */
+         const GLchan *data0 = (const GLchan *) img[0]->Data;
+         const GLchan *data1 = (const GLchan *) img[1]->Data;
+         const GLint comps0 = info->unit[0].comps;
+         const GLint comps1 = 3;
+         const GLint wmask0 = img[0]->Width - 1,  hmask0 = img[0]->Height - 1;
+         const GLint wmask1 = img[1]->Width - 1,  hmask1 = img[1]->Height - 1;
+         const GLint wlog0 = img[0]->WidthLog2,   wlog1 = img[1]->WidthLog2;
+         const GLint half0 = info->unit[0].linear ? FIXED_HALF : 0;
+         const GLint half1 = info->unit[1].linear ? FIXED_HALF : 0;
+         GLfixed s0 = (sFix[0] >> level[0]) - half0;
+         GLfixed t0 = (tFix[0] >> level[0]) - half0;
+         GLfixed s1 = (sFix[1] >> level[1]) - half1;
+         GLfixed t1 = (tFix[1] >> level[1]) - half1;
+         const GLfixed ds0 = sStep[0] >> level[0], dt0 = tStep[0] >> level[0];
+         const GLfixed ds1 = sStep[1] >> level[1], dt1 = tStep[1] >> level[1];
+
+         if (info->unit[0].linear) {
+            if (info->unit[1].linear) {
+               DUALTEX_LOOP(DUALTEX_LINEAR, DUALTEX_LINEAR)
+            }
+            else {
+               DUALTEX_LOOP(DUALTEX_LINEAR, DUALTEX_NEAREST)
+            }
+         }
+         else {
+            if (info->unit[1].linear) {
+               DUALTEX_LOOP(DUALTEX_NEAREST, DUALTEX_LINEAR)
+            }
+            else {
+               DUALTEX_LOOP(DUALTEX_NEAREST, DUALTEX_NEAREST)
+            }
+         }
+      }
+
+      /* Start the next sub-span from the exact end point rather than the
+       * accumulated steps, so rounding error cannot build up along the span.
+       */
+      for (u = 0; u < 2; u++) {
+         sFix[u] = (GLfixed) ((sTex[u] - sBias[u]) * FIXED_SCALE);
+         tFix[u] = (GLfixed) ((tTex[u] - tBias[u]) * FIXED_SCALE);
+      }
+      left -= n;
+   }
+
+   ASSERT(span->arrayMask & SPAN_RGBA);
+   _mesa_write_rgba_span(ctx, span);
+}
+
+#undef DUALTEX_LERP
+#undef DUALTEX_NEAREST
+#undef DUALTEX_LINEAR
+#undef DUALTEX_LOOP
+
+
+/*
+ * Render a perspective corrected, two-unit (texture * lightmap) triangle.
+ */
+static void dualtex_triangle( GLcontext *ctx,
+                              const SWvertex *v0,
+                              const SWvertex *v1,
+                              const SWvertex *v2 )
+{
+#define INTERP_Z 1
+#define INTERP_FOG 1
+#define DEPTH_TYPE DEFAULT_SOFTWARE_DEPTH_TYPE
+#define INTERP_RGB 1
+#define INTERP_ALPHA 1
+#define INTERP_MULTITEX 1
+
+#define SETUP_CODE							\
+   struct dualtex_info info;						\
+   if (!dualtex_setup(ctx, &info))					\
+      return;
+
+#define RENDER_SPAN( span )			\
+   span.interpMask &= ~SPAN_RGBA;		\
+   span.arrayMask |= SPAN_RGBA;			\
+   dualtex_span(ctx, &span, &info);
+
+#include "s_tritemp.h"
+
+}
+
+#endif /* CHAN_BITS == 8 */
+
+
 /*
  * Render a smooth-shaded, textured, RGBA triangle.
  * Interpolate S,T,R with perspective correction, w/out mipmapping.
@@ -1176,7 +1673,16 @@ _swrast_choose_triangle( GLcontext *ctx )
          else {
             /* general case textured triangles */
             if (ctx->Texture._EnabledUnits > 1) {
-               USE(multitextured_triangle);
+#if CHAN_BITS == 8
+               /* NOVA: texture * lightmap in fixed point, if the state fits */
+               if (dualtex_usable(ctx)) {
+                  USE(dualtex_triangle);
+               }
+               else
+#endif
+               {
+                  USE(multitextured_triangle);
+               }
             }
             else {
                USE(general_textured_triangle);
