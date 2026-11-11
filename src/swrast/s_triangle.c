@@ -294,6 +294,61 @@ static void simple_z_textured_triangle( GLcontext *ctx,
 
 #if CHAN_TYPE != GL_FLOAT
 
+/*
+ * NOVA: the textured fast paths below fill in the colour array and only then
+ * hand the span to _mesa_write_rgba_span() for the depth test, so hidden
+ * fragments used to be textured and then thrown away.  With Quake-style
+ * unsorted geometry that is a large share of all fragments.  These two helpers
+ * let a span function discard a fully hidden span before doing any work.
+ *
+ * It is only safe when nothing else depends on the span being processed
+ * (stencil, clipping) and the depth buffer is our own 16-bit software one.
+ */
+static INLINE GLboolean
+span_zreject_ok( const GLcontext *ctx )
+{
+   const SWcontext *swrast = SWRAST_CONTEXT(ctx);
+   return (GLboolean) (ctx->Depth.Test
+                       && (ctx->Depth.Func == GL_LESS
+                           || ctx->Depth.Func == GL_LEQUAL)
+                       && ctx->Visual.depthBits <= 16
+                       && ctx->DrawBuffer->DepthBuffer
+                       && !swrast->Driver.ReadDepthSpan
+                       && !ctx->Stencil.Enabled
+                       && !(swrast->_RasterMask & CLIP_BIT));
+}
+
+/*
+ * Would every fragment of this span fail the depth test?
+ * Mirrors _mesa_span_interpolate_z() + depth_test_span16(), without writing.
+ */
+static INLINE GLboolean
+span_hidden( const GLcontext *ctx, const struct sw_span *span )
+{
+   const GLushort *zbuf = (const GLushort *) ctx->DrawBuffer->DepthBuffer
+                        + ctx->DrawBuffer->Width * span->y + span->x;
+   const GLfixed zStep = span->zStep;
+   GLfixed z = span->z;
+   GLuint i;
+
+   if (ctx->Depth.Func == GL_LESS) {
+      for (i = 0; i < span->end; i++) {
+         if ((GLdepth) FixedToInt(z) < (GLdepth) zbuf[i])
+            return GL_FALSE;
+         z += zStep;
+      }
+   }
+   else {
+      for (i = 0; i < span->end; i++) {
+         if ((GLdepth) FixedToInt(z) <= (GLdepth) zbuf[i])
+            return GL_FALSE;
+         z += zStep;
+      }
+   }
+   return GL_TRUE;
+}
+
+
 struct affine_info
 {
    GLenum filter;
@@ -304,6 +359,11 @@ struct affine_info
    const GLchan *texture;
    GLfixed er, eg, eb, ea;
    GLint tbytesline, tsize;
+   /* NOVA: */
+   GLboolean zReject;                     /* see span_zreject_ok() */
+   const struct gl_texture_object *obj;   /* perspective path only */
+   GLint maxLevel;                        /* perspective path only: highest
+                                           * mip level usable above BaseLevel */
 };
 
 
@@ -311,9 +371,13 @@ struct affine_info
  * textures with GL_REPLACE, GL_MODULATE, GL_BLEND, GL_DECAL or GL_ADD
  * texture env modes.
  */
+/* NOVA: this is the body of the original affine_span(), split out so the
+ * perspective path can run it over short sub-spans as well.  It textures 'n'
+ * fragments into 'dest', stepping span->intTex and the span colours.
+ */
 static INLINE void
-affine_span(GLcontext *ctx, struct sw_span *span,
-            struct affine_info *info)
+affine_fill(struct sw_span *span, const struct affine_info *info,
+            GLchan *dest, const GLuint n)
 {
    GLchan sample[4];  /* the filtered texture sample */
 
@@ -402,7 +466,7 @@ affine_span(GLcontext *ctx, struct sw_span *span,
 #define NEAREST_RGBA_REPLACE  COPY_CHAN4(dest, tex00)
 
 #define SPAN_NEAREST(DO_TEX,COMP)					\
-	for (i = 0; i < span->end; i++) {				\
+	for (i = 0; i < n; i++)       {				\
            /* Isn't it necessary to use FixedFloor below?? */		\
            GLint s = FixedToInt(span->intTex[0]) & info->smask;		\
            GLint t = FixedToInt(span->intTex[1]) & info->tmask;		\
@@ -419,7 +483,7 @@ affine_span(GLcontext *ctx, struct sw_span *span,
 	}
 
 #define SPAN_LINEAR(DO_TEX,COMP)					\
-	for (i = 0; i < span->end; i++) {				\
+	for (i = 0; i < n; i++)       {				\
            /* Isn't it necessary to use FixedFloor below?? */		\
            GLint s = FixedToInt(span->intTex[0]) & info->smask;		\
            GLint t = FixedToInt(span->intTex[1]) & info->tmask;		\
@@ -454,7 +518,6 @@ affine_span(GLcontext *ctx, struct sw_span *span,
 
 
    GLuint i;
-   GLchan *dest = span->array->rgba[0];
 
    span->intTex[0] -= FIXED_HALF;
    span->intTex[1] -= FIXED_HALF;
@@ -550,12 +613,24 @@ affine_span(GLcontext *ctx, struct sw_span *span,
       }
       break;
    }
-   span->interpMask &= ~SPAN_RGBA;
-   ASSERT(span->arrayMask & SPAN_RGBA);
-   _mesa_write_rgba_span(ctx, span);
 
 #undef SPAN_NEAREST
 #undef SPAN_LINEAR
+}
+
+
+static INLINE void
+affine_span(GLcontext *ctx, struct sw_span *span,
+            struct affine_info *info)
+{
+   if (info->zReject && span_hidden(ctx, span))
+      return;
+
+   affine_fill(span, info, span->array->rgba[0], span->end);
+
+   span->interpMask &= ~SPAN_RGBA;
+   ASSERT(span->arrayMask & SPAN_RGBA);
+   _mesa_write_rgba_span(ctx, span);
 }
 
 
@@ -591,6 +666,7 @@ static void affine_textured_triangle( GLcontext *ctx,
    info.format = obj->Image[b]->Format;					\
    info.filter = obj->MinFilter;					\
    info.envmode = unit->EnvMode;					\
+   info.zReject = span_zreject_ok(ctx);					\
    span.arrayMask |= SPAN_RGBA;						\
 									\
    if (info.envmode == GL_BLEND) {					\
@@ -634,200 +710,127 @@ static void affine_textured_triangle( GLcontext *ctx,
 
 
 
-struct persp_info
-{
-   GLenum filter;
-   GLenum format;
-   GLenum envmode;
-   GLint smask, tmask;
-   GLint twidth_log2;
-   const GLchan *texture;
-   GLfixed er, eg, eb, ea;   /* texture env color */
-   GLint tbytesline, tsize;
-};
-
+/*
+ * NOVA: perspective-correct span, rewritten.
+ *
+ * The original did a double-precision divide and two float->int conversions
+ * for every pixel.  This version divides once every PERSP_SUBDIV pixels and
+ * runs the integer affine inner loop in between -- what Quake's own software
+ * renderer does, and visually indistinguishable at this step size.
+ *
+ * It also handles GL_NEAREST_MIPMAP_NEAREST / GL_LINEAR_MIPMAP_NEAREST, with
+ * the level picked once per sub-span, so mipmapped textures no longer drop
+ * to the general float path.
+ */
+#define PERSP_SUBDIV       16
+#define PERSP_SUBDIV_SHIFT 4
 
 static INLINE void
 fast_persp_span(GLcontext *ctx, struct sw_span *span,
-		struct persp_info *info)
+		const struct affine_info *base)
 {
-   GLchan sample[4];  /* the filtered texture sample */
-
-  /* Instead of defining a function for each mode, a test is done
-   * between the outer and inner loops. This is to reduce code size
-   * and complexity. Observe that an optimizing compiler kills
-   * unused variables (for instance tf,sf,ti,si in case of GL_NEAREST).
-   */
-#define SPAN_NEAREST(DO_TEX,COMP)					\
-	for (i = 0; i < span->end; i++) {				\
-           GLdouble invQ = tex_coord[2] ?				\
-                                 (1.0 / tex_coord[2]) : 1.0;            \
-           GLfloat s_tmp = (GLfloat) (tex_coord[0] * invQ);		\
-           GLfloat t_tmp = (GLfloat) (tex_coord[1] * invQ);		\
-           GLint s = IFLOOR(s_tmp) & info->smask;	        	\
-           GLint t = IFLOOR(t_tmp) & info->tmask;	        	\
-           GLint pos = (t << info->twidth_log2) + s;			\
-           const GLchan *tex00 = info->texture + COMP * pos;		\
-           DO_TEX;							\
-           span->red += span->redStep;					\
-	   span->green += span->greenStep;				\
-           span->blue += span->blueStep;				\
-	   span->alpha += span->alphaStep;				\
-	   tex_coord[0] += tex_step[0];					\
-	   tex_coord[1] += tex_step[1];					\
-	   tex_coord[2] += tex_step[2];					\
-           dest += 4;							\
-	}
-
-#define SPAN_LINEAR(DO_TEX,COMP)					\
-	for (i = 0; i < span->end; i++) {				\
-           GLdouble invQ = tex_coord[2] ?				\
-                                 (1.0 / tex_coord[2]) : 1.0;            \
-           GLfloat s_tmp = (GLfloat) (tex_coord[0] * invQ);		\
-           GLfloat t_tmp = (GLfloat) (tex_coord[1] * invQ);		\
-           GLfixed s_fix = FloatToFixed(s_tmp) - FIXED_HALF;		\
-           GLfixed t_fix = FloatToFixed(t_tmp) - FIXED_HALF;        	\
-           GLint s = FixedToInt(FixedFloor(s_fix)) & info->smask;	\
-           GLint t = FixedToInt(FixedFloor(t_fix)) & info->tmask;	\
-           GLfixed sf = s_fix & FIXED_FRAC_MASK;			\
-           GLfixed tf = t_fix & FIXED_FRAC_MASK;			\
-           GLfixed si = FIXED_FRAC_MASK - sf;				\
-           GLfixed ti = FIXED_FRAC_MASK - tf;				\
-           GLint pos = (t << info->twidth_log2) + s;			\
-           const GLchan *tex00 = info->texture + COMP * pos;		\
-           const GLchan *tex10 = tex00 + info->tbytesline;		\
-           const GLchan *tex01 = tex00 + COMP;				\
-           const GLchan *tex11 = tex10 + COMP;				\
-           (void) ti;							\
-           (void) si;							\
-           if (t == info->tmask) {					\
-              tex10 -= info->tsize;					\
-              tex11 -= info->tsize;					\
-           }								\
-           if (s == info->smask) {					\
-              tex01 -= info->tbytesline;				\
-              tex11 -= info->tbytesline;				\
-           }								\
-           DO_TEX;							\
-           span->red   += span->redStep;				\
-	   span->green += span->greenStep;				\
-           span->blue  += span->blueStep;				\
-	   span->alpha += span->alphaStep;				\
-	   tex_coord[0] += tex_step[0];					\
-	   tex_coord[1] += tex_step[1];					\
-	   tex_coord[2] += tex_step[2];					\
-           dest += 4;							\
-	}
-
-   GLuint i;
-   GLfloat tex_coord[3], tex_step[3];
+   struct affine_info info = *base;   /* per-level copy for affine_fill() */
+   const GLfloat width = (GLfloat) (base->smask + 1);
+   const GLfloat height = (GLfloat) (base->tmask + 1);
+   const GLint comps = (base->format == GL_RGBA) ? 4 : 3;
+   /* homogeneous coords, scaled so that s/q is in base-level texels */
+   const GLfloat hsStep = span->texStepX[0][0] * width;
+   const GLfloat htStep = span->texStepX[0][1] * height;
+   const GLfloat hqStep = span->texStepX[0][3];
+   GLfloat hs = span->tex[0][0] * width;
+   GLfloat ht = span->tex[0][1] * height;
+   GLfloat hq = span->tex[0][3];
+   GLfloat invQ, sTex, tTex, sBias, tBias;
+   GLfixed sFix, tFix;
    GLchan *dest = span->array->rgba[0];
+   GLuint left = span->end;
+   GLint curLevel = 0;
 
-   tex_coord[0] = span->tex[0][0]  * (info->smask + 1);
-   tex_step[0] = span->texStepX[0][0] * (info->smask + 1);
-   tex_coord[1] = span->tex[0][1] * (info->tmask + 1);
-   tex_step[1] = span->texStepX[0][1] * (info->tmask + 1);
-   /* span->tex[0][2] only if 3D-texturing, here only 2D */
-   tex_coord[2] = span->tex[0][3];
-   tex_step[2] = span->texStepX[0][3];
+   if (base->zReject && span_hidden(ctx, span))
+      return;
 
-   switch (info->filter) {
-   case GL_NEAREST:
-      switch (info->format) {
-      case GL_RGB:
-         switch (info->envmode) {
-         case GL_MODULATE:
-            SPAN_NEAREST(NEAREST_RGB;MODULATE,3);
-            break;
-         case GL_DECAL:
-         case GL_REPLACE:
-            SPAN_NEAREST(NEAREST_RGB_REPLACE,3);
-            break;
-         case GL_BLEND:
-            SPAN_NEAREST(NEAREST_RGB;BLEND,3);
-            break;
-         case GL_ADD:
-            SPAN_NEAREST(NEAREST_RGB;ADD,3);
-            break;
-         default:
-            abort();
+   invQ = (hq == 0.0F) ? 1.0F : (1.0F / hq);
+   sTex = hs * invQ;
+   tTex = ht * invQ;
+   /* The texture repeats: drop the whole repeats at the left end so the
+    * fixed-point coordinates stay small wherever the polygon is.
+    */
+   sBias = (GLfloat) IFLOOR(sTex / width) * width;
+   tBias = (GLfloat) IFLOOR(tTex / height) * height;
+   sFix = (GLfixed) ((sTex - sBias) * FIXED_SCALE);
+   tFix = (GLfixed) ((tTex - tBias) * FIXED_SCALE);
+
+   while (left > 0) {
+      const GLuint n = (left > PERSP_SUBDIV) ? PERSP_SUBDIV : left;
+      GLfixed sEnd, tEnd, sStep, tStep;
+      GLint level = 0;
+
+      if (base->maxLevel > 0) {
+         /* texel footprint of a pixel at the left end of the sub-span;
+          * level k is rho in (2^(k-0.5), 2^(k+0.5)]
+          */
+         const GLfloat dudx = FABSF((hsStep - sTex * hqStep) * invQ);
+         const GLfloat dvdx = FABSF((htStep - tTex * hqStep) * invQ);
+         const GLfloat dudy = FABSF((span->texStepY[0][0] * width
+                                     - sTex * span->texStepY[0][3]) * invQ);
+         const GLfloat dvdy = FABSF((span->texStepY[0][1] * height
+                                     - tTex * span->texStepY[0][3]) * invQ);
+         const GLfloat maxU = MAX2(dudx, dudy);
+         const GLfloat maxV = MAX2(dvdx, dvdy);
+         const GLfloat rho = MAX2(maxU, maxV);
+         GLfloat threshold = 1.41421356F;
+         while (level < base->maxLevel && rho > threshold) {
+            level++;
+            threshold *= 2.0F;
          }
-         break;
-      case GL_RGBA:
-         switch(info->envmode) {
-         case GL_MODULATE:
-            SPAN_NEAREST(NEAREST_RGBA;MODULATE,4);
-            break;
-         case GL_DECAL:
-            SPAN_NEAREST(NEAREST_RGBA;DECAL,4);
-            break;
-         case GL_BLEND:
-            SPAN_NEAREST(NEAREST_RGBA;BLEND,4);
-            break;
-         case GL_ADD:
-            SPAN_NEAREST(NEAREST_RGBA;ADD,4);
-            break;
-         case GL_REPLACE:
-            SPAN_NEAREST(NEAREST_RGBA_REPLACE,4);
-            break;
-         default:
-            abort();
+         if (level != curLevel) {
+            const struct gl_texture_image *img =
+               base->obj->Image[base->obj->BaseLevel + level];
+            info.texture = (const GLchan *) img->Data;
+            info.twidth_log2 = img->WidthLog2;
+            info.smask = img->Width - 1;
+            info.tmask = img->Height - 1;
+            info.tbytesline = img->Width * comps;
+            info.tsize = img->Height * info.tbytesline;
+            curLevel = level;
          }
-         break;
       }
-      break;
 
-   case GL_LINEAR:
-      switch (info->format) {
-      case GL_RGB:
-         switch (info->envmode) {
-         case GL_MODULATE:
-            SPAN_LINEAR(LINEAR_RGB;MODULATE,3);
-            break;
-         case GL_DECAL:
-         case GL_REPLACE:
-            SPAN_LINEAR(LINEAR_RGB;REPLACE,3);
-            break;
-         case GL_BLEND:
-            SPAN_LINEAR(LINEAR_RGB;BLEND,3);
-            break;
-         case GL_ADD:
-            SPAN_LINEAR(LINEAR_RGB;ADD,3);
-            break;
-         default:
-            abort();
-         }
-         break;
-      case GL_RGBA:
-         switch (info->envmode) {
-         case GL_MODULATE:
-            SPAN_LINEAR(LINEAR_RGBA;MODULATE,4);
-            break;
-         case GL_DECAL:
-            SPAN_LINEAR(LINEAR_RGBA;DECAL,4);
-            break;
-         case GL_BLEND:
-            SPAN_LINEAR(LINEAR_RGBA;BLEND,4);
-            break;
-         case GL_ADD:
-            SPAN_LINEAR(LINEAR_RGBA;ADD,4);
-            break;
-         case GL_REPLACE:
-            SPAN_LINEAR(LINEAR_RGBA;REPLACE,4);
-            break;
-         default:
-            abort();
-         }
-         break;
+      /* exact coordinates at the right end of the sub-span */
+      hs += hsStep * (GLfloat) n;
+      ht += htStep * (GLfloat) n;
+      hq += hqStep * (GLfloat) n;
+      invQ = (hq == 0.0F) ? 1.0F : (1.0F / hq);
+      sTex = hs * invQ;
+      tTex = ht * invQ;
+      sEnd = (GLfixed) ((sTex - sBias) * FIXED_SCALE);
+      tEnd = (GLfixed) ((tTex - tBias) * FIXED_SCALE);
+      if (n == PERSP_SUBDIV) {
+         sStep = (sEnd - sFix) >> PERSP_SUBDIV_SHIFT;
+         tStep = (tEnd - tFix) >> PERSP_SUBDIV_SHIFT;
       }
-      break;
+      else {
+         sStep = (sEnd - sFix) / (GLint) n;
+         tStep = (tEnd - tFix) / (GLint) n;
+      }
+
+      /* affine_fill() expects the half-texel bias s_tritemp.h gives
+       * INTERP_INT_TEX coordinates, and removes it again itself.
+       */
+      span->intTex[0] = (sFix >> level) + FIXED_HALF;
+      span->intTex[1] = (tFix >> level) + FIXED_HALF;
+      span->intTexStep[0] = sStep >> level;
+      span->intTexStep[1] = tStep >> level;
+      affine_fill(span, &info, dest, n);
+
+      dest += 4 * n;
+      sFix = sEnd;
+      tFix = tEnd;
+      left -= n;
    }
-   
+
    ASSERT(span->arrayMask & SPAN_RGBA);
    _mesa_write_rgba_span(ctx, span);
-
-#undef SPAN_NEAREST
-#undef SPAN_LINEAR
 }
 
 
@@ -850,7 +853,7 @@ static void persp_textured_triangle( GLcontext *ctx,
 #define INTERP_TEX 1
 
 #define SETUP_CODE							\
-   struct persp_info info;						\
+   struct affine_info info;						\
    const struct gl_texture_unit *unit = ctx->Texture.Unit+0;		\
    const struct gl_texture_object *obj = unit->Current2D;		\
    const GLint b = obj->BaseLevel;					\
@@ -859,8 +862,12 @@ static void persp_textured_triangle( GLcontext *ctx,
    info.smask = obj->Image[b]->Width - 1;				\
    info.tmask = obj->Image[b]->Height - 1;				\
    info.format = obj->Image[b]->Format;					\
-   info.filter = obj->MinFilter;					\
+   info.filter = obj->MagFilter;					\
    info.envmode = unit->EnvMode;					\
+   info.zReject = span_zreject_ok(ctx);					\
+   info.obj = obj;							\
+   info.maxLevel = (obj->MinFilter == obj->MagFilter)			\
+                 ? 0 : (obj->_MaxLevel - obj->BaseLevel);		\
 									\
    if (info.envmode == GL_BLEND) {					\
       /* potential off-by-one error here? (1.0f -> 2048 -> 0) */	\
@@ -1084,7 +1091,6 @@ dualtex_usable( const GLcontext *ctx )
 static GLboolean
 dualtex_setup( const GLcontext *ctx, struct dualtex_info *info )
 {
-   const SWcontext *swrast = SWRAST_CONTEXT(ctx);
    const struct gl_texture_unit *unit1 = &ctx->Texture.Unit[1];
    GLuint u;
 
@@ -1106,49 +1112,7 @@ dualtex_setup( const GLcontext *ctx, struct dualtex_info *info )
    info->rgbShift = (unit1->EnvMode == GL_COMBINE_EXT)
                   ? (GLint) unit1->CombineScaleShiftRGB : 0;
 
-   /* A span that fails the depth test everywhere can be thrown away before
-    * it is textured, provided nothing else (stencil, clipping) depends on it
-    * and we can look at the depth buffer directly.
-    */
-   info->zReject = (ctx->Depth.Test
-                    && (ctx->Depth.Func == GL_LESS
-                        || ctx->Depth.Func == GL_LEQUAL)
-                    && ctx->Visual.depthBits <= 16
-                    && ctx->DrawBuffer->DepthBuffer
-                    && !swrast->Driver.ReadDepthSpan
-                    && !ctx->Stencil.Enabled
-                    && !(swrast->_RasterMask & CLIP_BIT));
-   return GL_TRUE;
-}
-
-
-/*
- * Would every fragment of this span fail the depth test?
- * Mirrors _mesa_span_interpolate_z() + depth_test_span16(), without writing.
- */
-static INLINE GLboolean
-dualtex_span_hidden( const GLcontext *ctx, const struct sw_span *span )
-{
-   const GLushort *zbuf = (const GLushort *) ctx->DrawBuffer->DepthBuffer
-                        + ctx->DrawBuffer->Width * span->y + span->x;
-   const GLfixed zStep = span->zStep;
-   GLfixed z = span->z;
-   GLuint i;
-
-   if (ctx->Depth.Func == GL_LESS) {
-      for (i = 0; i < span->end; i++) {
-         if ((GLdepth) FixedToInt(z) < (GLdepth) zbuf[i])
-            return GL_FALSE;
-         z += zStep;
-      }
-   }
-   else {
-      for (i = 0; i < span->end; i++) {
-         if ((GLdepth) FixedToInt(z) <= (GLdepth) zbuf[i])
-            return GL_FALSE;
-         z += zStep;
-      }
-   }
+   info->zReject = span_zreject_ok(ctx);
    return GL_TRUE;
 }
 
@@ -1236,7 +1200,7 @@ dualtex_span( GLcontext *ctx, struct sw_span *span,
    GLuint left = span->end;
    GLuint u;
 
-   if (info->zReject && dualtex_span_hidden(ctx, span))
+   if (info->zReject && span_hidden(ctx, span))
       return;
 
    for (u = 0; u < 2; u++) {
@@ -1635,10 +1599,16 @@ _swrast_choose_triangle( GLcontext *ctx )
              && texImg->Border==0
              && texImg->Width == texImg->RowStride
              && (format == MESA_FORMAT_RGB || format == MESA_FORMAT_RGBA)
-	     && minFilter == magFilter
+	     && (minFilter == magFilter
+#if CHAN_BITS == 8
+                 /* NOVA: *_MIPMAP_NEAREST is handled by fast_persp_span() */
+                 || dualtex_texture_ok(&ctx->Texture.Unit[0], GL_TRUE)
+#endif
+                 )
 	     && ctx->Light.Model.ColorControl == GL_SINGLE_COLOR
 	     && ctx->Texture.Unit[0].EnvMode != GL_COMBINE_EXT) {
-	    if (ctx->Hint.PerspectiveCorrection==GL_FASTEST) {
+	    if (ctx->Hint.PerspectiveCorrection==GL_FASTEST
+                && minFilter == magFilter) {
 	       if (minFilter == GL_NEAREST
 		   && format == MESA_FORMAT_RGB
 		   && (envMode == GL_REPLACE || envMode == GL_DECAL)

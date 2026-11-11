@@ -315,10 +315,13 @@ compute_lambda(GLfloat dsdx, GLfloat dsdy, GLfloat dtdx, GLfloat dtdy,
                GLfloat dqdx, GLfloat dqdy, GLfloat texW, GLfloat texH,
                GLfloat s, GLfloat t, GLfloat q, GLfloat invQ)
 {
-   GLfloat dsdx2 = (s + dsdx) / (q + dqdx) - s * invQ;
-   GLfloat dtdx2 = (t + dtdx) / (q + dqdx) - t * invQ;
-   GLfloat dsdy2 = (s + dsdy) / (q + dqdy) - s * invQ;
-   GLfloat dtdy2 = (t + dtdy) / (q + dqdy) - t * invQ;
+   /* NOVA: two divides instead of four -- s and t share each denominator */
+   const GLfloat invQx = 1.0F / (q + dqdx);
+   const GLfloat invQy = 1.0F / (q + dqdy);
+   GLfloat dsdx2 = (s + dsdx) * invQx - s * invQ;
+   GLfloat dtdx2 = (t + dtdx) * invQx - t * invQ;
+   GLfloat dsdy2 = (s + dsdy) * invQy - s * invQ;
+   GLfloat dtdy2 = (t + dtdy) * invQy - t * invQ;
    GLfloat maxU, maxV, rho, lambda;
    dsdx2 = FABSF(dsdx2);
    dsdy2 = FABSF(dsdy2);
@@ -1164,13 +1167,13 @@ _mesa_write_texture_span( GLcontext *ctx, struct sw_span *span)
       stipple_polygon_span(ctx, span);
    }
 
-   /* Need texture coordinates now */
-   if ((span->interpMask & SPAN_TEXTURE)
-       && (span->arrayMask & SPAN_TEXTURE) == 0)
-      interpolate_texcoords(ctx, span);
-
    /* Texture with alpha test */
    if (ctx->Color.AlphaEnabled) {
+
+      /* Need texture coordinates now */
+      if ((span->interpMask & SPAN_TEXTURE)
+          && (span->arrayMask & SPAN_TEXTURE) == 0)
+         interpolate_texcoords(ctx, span);
 
       /* Now we need the rgba array, fill it in if needed */
       if ((span->interpMask & SPAN_RGBA) && (span->arrayMask & SPAN_RGBA) == 0)
@@ -1223,6 +1226,14 @@ _mesa_write_texture_span( GLcontext *ctx, struct sw_span *span)
 
    /* Texture without alpha test */
    if (!ctx->Color.AlphaEnabled) {
+
+      /* NOVA: the texcoord interpolation (a float divide per pixel per unit,
+       * plus the lambda work when mipmapping) used to be done before the
+       * depth test even here, so fully hidden spans paid for it too.
+       */
+      if ((span->interpMask & SPAN_TEXTURE)
+          && (span->arrayMask & SPAN_TEXTURE) == 0)
+         interpolate_texcoords(ctx, span);
 
       /* Now we need the rgba array, fill it in if needed */
       if ((span->interpMask & SPAN_RGBA) && (span->arrayMask & SPAN_RGBA) == 0)
