@@ -3117,9 +3117,17 @@ static void save_TexGeniv(GLenum coord, GLenum pname, const GLint *params )
 {
    GLfloat p[4];
    p[0] = (GLfloat) params[0];
-   p[1] = (GLfloat) params[1];
-   p[2] = (GLfloat) params[2];
-   p[3] = (GLfloat) params[3];
+   /* NOVA: only the plane equations have four elements.  glTexGeni() passes
+    * the address of a single GLint, so reading further was out of bounds.
+    */
+   if (pname == GL_OBJECT_PLANE || pname == GL_EYE_PLANE) {
+      p[1] = (GLfloat) params[1];
+      p[2] = (GLfloat) params[2];
+      p[3] = (GLfloat) params[3];
+   }
+   else {
+      p[1] = p[2] = p[3] = 0.0F;
+   }
    save_TexGenfv(coord, pname, p);
 }
 
@@ -3150,7 +3158,11 @@ static void save_TexGenf( GLenum coord, GLenum pname, GLfloat param )
 
 static void save_TexGeni( GLenum coord, GLenum pname, GLint param )
 {
-   save_TexGeniv( coord, pname, &param );
+   /* NOVA: the vector form may read four elements */
+   GLint params[4];
+   params[0] = param;
+   params[1] = params[2] = params[3] = 0;
+   save_TexGeniv( coord, pname, params );
 }
 
 

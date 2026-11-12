@@ -52,6 +52,21 @@
 
 #define TC_ARGB32(r, g, b, a) (((a) << 24) | ((r) << 16) | ((g) << 8) | (b))
 
+// NOVA: whole-pixel conversion between Mesa's GLchan[4] (R,G,B,A in memory) and
+// the ARGB32 back buffer. On a big-endian CPU an RGBA quad read as one 32-bit
+// word is 0xRRGGBBAA and the pixel we want is 0xAARRGGBB, i.e. a rotate by 8.
+// GCC does not spot that in the byte-wise TC_ARGB32() form: it emits four byte
+// loads plus shifts and ORs (14 instructions per pixel on 68k) where this is
+// move.l / ror.l #8 / move.l. These loops run for every pixel drawn.
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+#define RGBA_WORD_TO_ARGB32(v)	(((v) >> 8) | ((v) << 24))
+#define ARGB32_TO_RGBA_WORD(v)	(((v) << 8) | ((v) >> 24))
+#else
+// Little-endian (only used for host-side test builds): word is 0xAABBGGRR.
+#define RGBA_WORD_TO_ARGB32(v)	(((v) & 0xff00ff00u) | (((v) & 0xff) << 16) | (((v) >> 16) & 0xff))
+#define ARGB32_TO_RGBA_WORD(v)	(((v) & 0xff00ff00u) | (((v) & 0xff) << 16) | (((v) >> 16) & 0xff))
+#endif
+
 static const GLubyte* get_string(GLcontext* ctx, GLenum name) {
 	if (name == GL_RENDERER) {
 		return (GLubyte*) "NovaMesa";
@@ -210,17 +225,19 @@ static void write_rgba_span(const GLcontext* gl_ctx, GLuint n, GLint x, GLint y,
 
 	// NOVA: row table removes the multiply that used to run on every span call
 	GLuint* buffer = a_ctx->row[y] + x;
+	const GLuint* src = (const GLuint*) rgba;	// NOVA: one 32-bit load per pixel
 
 	if (mask) {
 		for (GLuint i = 0; i < n; i++) {
 			if (mask[i]) {
-				// Convert 4-component RGB to 32-bit ARGB
-				buffer[i] = TC_ARGB32(rgba[i][RCOMP], rgba[i][GCOMP], rgba[i][BCOMP], rgba[i][ACOMP]);
+				const GLuint v = src[i];
+				buffer[i] = RGBA_WORD_TO_ARGB32(v);
 			}
 		}
 	} else {
 		for (GLuint i = 0; i < n; i++) {
-			buffer[i] = TC_ARGB32(rgba[i][RCOMP], rgba[i][GCOMP], rgba[i][BCOMP], rgba[i][ACOMP]);
+			const GLuint v = src[i];
+			buffer[i] = RGBA_WORD_TO_ARGB32(v);
 		}
 	}
 }
@@ -298,13 +315,11 @@ static void read_rgba_span(const GLcontext* gl_ctx, GLuint n, GLint x, GLint y, 
 	// NOVA: row table, and 32-bit fetches
 	const GLuint* src = a_ctx->row[y] + x;
 
-	for (GLuint i = 0; i < n; i++) {
-		GLuint pixel = src[i]; // Fetch the whole pixel at once
+	GLuint* dst = (GLuint*) rgba;	// NOVA: one 32-bit store per pixel
 
-		rgba[i][RCOMP] = (GLubyte) ((pixel >> 16) & 0xff);
-		rgba[i][GCOMP] = (GLubyte) ((pixel >> 8) & 0xff);
-		rgba[i][BCOMP] = (GLubyte) (pixel & 0xff);
-		rgba[i][ACOMP] = (GLubyte) ((pixel >> 24) & 0xff);
+	for (GLuint i = 0; i < n; i++) {
+		const GLuint pixel = src[i];
+		dst[i] = ARGB32_TO_RGBA_WORD(pixel);
 	}
 }
 

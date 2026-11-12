@@ -310,6 +310,36 @@ blend_modulate( GLcontext *ctx, GLuint n, const GLubyte mask[],
 
 
 /*
+ * NOVA: blend equation is ADD, func is (GL_DST_COLOR, GL_SRC_COLOR), i.e.
+ * 2 * src * dst.  This is the "2x modulate" used for overbright lightmap
+ * passes; without it that state fell through to blend_general(), which is
+ * float arithmetic and two switch statements for every pixel.
+ */
+#if CHAN_BITS == 8
+static void _BLENDAPI
+blend_modulate2x( GLcontext *ctx, GLuint n, const GLubyte mask[],
+                  GLchan rgba[][4], CONST GLchan dest[][4] )
+{
+   GLuint i;
+   (void) ctx;
+
+   for (i=0;i<n;i++) {
+      if (mask[i]) {
+         GLuint r = ((GLuint) rgba[i][RCOMP] * dest[i][RCOMP] * 2 + 255) >> 8;
+         GLuint g = ((GLuint) rgba[i][GCOMP] * dest[i][GCOMP] * 2 + 255) >> 8;
+         GLuint b = ((GLuint) rgba[i][BCOMP] * dest[i][BCOMP] * 2 + 255) >> 8;
+         GLuint a = ((GLuint) rgba[i][ACOMP] * dest[i][ACOMP] * 2 + 255) >> 8;
+         rgba[i][RCOMP] = (GLchan) MIN2(r, CHAN_MAX);
+         rgba[i][GCOMP] = (GLchan) MIN2(g, CHAN_MAX);
+         rgba[i][BCOMP] = (GLchan) MIN2(b, CHAN_MAX);
+         rgba[i][ACOMP] = (GLchan) MIN2(a, CHAN_MAX);
+      }
+   }
+}
+#endif
+
+
+/*
  * General case blend pixels.
  * Input:  n - number of pixels
  *         mask - the usual write mask
@@ -738,6 +768,12 @@ void _swrast_choose_blend_func( GLcontext *ctx )
 #endif
          SWRAST_CONTEXT(ctx)->BlendFunc = blend_modulate;
    }
+#if CHAN_BITS == 8
+   else if (eq==GL_FUNC_ADD_EXT
+            && srcRGB==GL_DST_COLOR && dstRGB==GL_SRC_COLOR) {
+      SWRAST_CONTEXT(ctx)->BlendFunc = blend_modulate2x;
+   }
+#endif
    else if (eq==GL_MIN_EXT) {
 #if defined(USE_MMX_ASM)
       if ( cpu_has_mmx ) {

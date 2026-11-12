@@ -154,8 +154,14 @@ AMesaContext* amesa_create_context(struct Window* window) {
 	//_mesa_enable_1_4_extensions(a_ctx->gl_ctx);
 
 	_mesa_debug(NULL, "Creating Mesa buffer...\n");
+	// NOVA: no software alpha buffer. The back buffer is ARGB32 and the span
+	// functions already store and read back the alpha byte themselves, so the
+	// separate GLchan-per-pixel alpha plane swrast would otherwise allocate is
+	// pure overhead: every span was written twice (once here, once by
+	// _mesa_write_alpha_span), every blended span was read twice, and
+	// ALPHABUF_BIT in _RasterMask disqualified the simple_*_textured fast paths.
 	a_ctx->gl_buffer = _mesa_create_framebuffer(a_ctx->gl_visual, a_ctx->gl_visual->depthBits > 0, a_ctx->gl_visual->stencilBits > 0,
-			a_ctx->gl_visual->accumRedBits > 0, a_ctx->gl_visual->alphaBits > 0);
+			a_ctx->gl_visual->accumRedBits > 0, GL_FALSE);
 	if (!a_ctx->gl_buffer) {
 		_mesa_error(NULL, GL_INVALID_VALUE, "Could not create the GL Buffer");
 		return NULL;

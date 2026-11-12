@@ -204,8 +204,15 @@ do {						\
 #endif
 
 
+/* NOVA: m68k added. The 68k FPU is IEEE-754 and a GLfloat is a 32-bit single,
+ * so every USE_IEEE trick below is valid (they pun float<->int through
+ * same-size unions, which is endian-neutral). Without this, m68k silently
+ * took the "slow, portable" branches: LOG2() was a libm log() call for every
+ * mipmapped pixel, IFLOOR/ICEIL were a round + compare + branch, and
+ * IS_INF_OR_NAN was a finite() call per triangle.
+ */
 #if defined(__i386__) || defined(__sparc__) || defined(__s390x__) || \
-    defined(__powerpc__) || \
+    defined(__powerpc__) || defined(__mc68000__) || defined(__m68k__) || \
     ( defined(__alpha__) && ( defined(__IEEE_FLOAT) || !defined(VMS) ) )
 #define USE_IEEE
 #endif
@@ -635,17 +642,21 @@ static INLINE GLfloat LOG2(GLfloat x)
 
 /* Pretty fast, and accurate.
  * Based on code from http://www.flipcode.com/totd/
+ *
+ * NOVA: rewritten to pun through a union. The original read and wrote the
+ * float through a GLint pointer, which modern GCC is entitled to miscompile
+ * under -fstrict-aliasing (on by default at -O2).
  */
 static INLINE GLfloat LOG2(GLfloat val)
 {
-   GLint *exp_ptr = (GLint *) &val;
-   GLint x = *exp_ptr;
-   const GLint log_2 = ((x >> 23) & 255) - 128;
-   x &= ~(255 << 23);
-   x += 127 << 23;
-   *exp_ptr = x;
-   val = ((-1.0f/3) * val + 2) * val - 2.0f/3;
-   return val + log_2;
+   fi_type num;
+   GLint log_2;
+   num.f = val;
+   log_2 = ((num.i >> 23) & 255) - 128;
+   num.i &= ~(255 << 23);
+   num.i += 127 << 23;
+   num.f = ((-1.0f/3) * num.f + 2) * num.f - 2.0f/3;
+   return num.f + log_2;
 }
 
 #else /* USE_IEEE */

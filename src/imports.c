@@ -144,7 +144,8 @@ void _mesa_error(GLcontext *ctx, GLenum error, const char *fmtString, ...) {
 		break;
 	}
 
-	sprintf(message, "Mesa user error: %s in %s\n", errstr, where);
+	// NOVA: bounded, so an over-long message cannot overrun the buffer
+	snprintf(message, sizeof(message), "Mesa user error: %s in %s\n", errstr, where);
 
 	if (!_errorLogFile) {
 		// Always append for errors.
