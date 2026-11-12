@@ -102,8 +102,9 @@ On branch `claude/fitzquake-68k-perf-review-w00266`:
 Measured with the benchmark, default lightmapped state: 17.7 ms -> about 5 ms
 per frame native x86-64 at 640x480; 356 ms -> about 34 ms as m68k code under
 qemu at 320x240. qemu emulates the FPU in software and so overstates float
-cost; Emu68 should land between those two ratios. **None of this has been
-measured on real hardware yet.**
+cost; Emu68 should land between those two ratios. The owner measured
+FitzQuake `timedemo` in FS-UAE going from about 10 to 26.3 FPS with this
+round; nothing has been measured on a real PiStorm yet.
 
 Known visual differences from stock: the subdivided paths differ slightly on
 steeply angled surfaces and at mip boundaries; bilinear in the dualtex path
@@ -123,7 +124,8 @@ renders a corridor of lightmapped quads under several state combinations
     ./build.sh                                              # native
     CFLAGS=-DDEBUG TAG=debug ./build.sh                     # prints triangle function names
     CC="m68k-linux-gnu-gcc -m68040" LDFLAGS=-static TAG=m68k ./build.sh
-    out/bench 640 480 30
+    out/bench 640 480 30                                    # fill-rate bound corridor
+    out/geom 640 480 30                                     # geometry-bound workloads
     qemu-m68k-static out/bench_m68k 320 240 2 /tmp/shot     # also dumps PPMs
     python3 cmp.py before.ppm after.ppm                     # % differing pixels
 
@@ -139,51 +141,136 @@ Use it this way:
   repeat; run-to-run noise under qemu is around 10-15%.
 - `valgrind --tool=callgrind` on a `-g` native build gives a usable
   instruction-count profile.
-- The scene is fill-rate bound and Quake-shaped. It says little about vertex
-  or triangle-setup cost. Add scenes before optimising those (see below).
+- `bench` is fill-rate bound and Quake-shaped; `geom` covers many small
+  triangles, lit and untextured geometry, lines and 2D. Run both: a change
+  must not make either slower.
 
-## Planned next: triangle setup and the vertex pipeline
+## Second round: small triangles and geometry (done)
 
-Not started. Wait for the owner's on-hardware results from the work above; if
-typical scenes are fill-rate bound, this may not be worth doing.
+`test/hostbench/geom.c` was added for geometry-bound workloads: gears (display
+lists, lit), 24 tessellated spheres (textured with colour per vertex; GL lit;
+flat), 4000 additive 2D lines, 3000 blended textured 2D quads.
 
-Steps, in order:
+What profiling it showed:
 
-1. **Extend the benchmark** with workloads that are not Quake-shaped: several
-   thousand small triangles, smooth-shaded and lit; untextured geometry;
-   something close to the Gears example and to G-WARS. No change may make any
-   of them slower.
-2. **Profile that**, then fix what the profile shows. Candidates, from reading
-   the code (not yet measured):
-   - *Triangle setup* (`s_tritemp.h`): three float divides and many
-     float->fixed conversions per triangle. A fixed-point setup, or computing
-     only the gradients a given triangle function needs, should help scenes
-     with many small triangles.
-   - *Immediate mode* (`tnl/t_imm_*.c`): every `glVertex`/`glTexCoord` goes
-     through the dispatch table into the immediate buffer, is then run through
-     the pipeline, and copied again into `SWvertex` by `swrast_setup`. Look for
-     a shorter route for the common case (position plus one or two texcoords,
-     no lighting).
-   - *Pipeline stages* (`tnl/t_pipeline.c`, `t_vb_*.c`): the fixed stage list
-     is walked for every batch. Check that inactive stages are cheap.
-   - *Clipping* (`tnl/t_vb_cliptmp.h`): generic, interpolates every attribute.
-   - *State validation*: every `glBindTexture` sets `_NEW_TEXTURE` and forces
-     the triangle and sampler functions to be re-chosen before the next
-     primitive.
-3. **Widen the narrow fast paths where cheap**: `GL_MODULATE` on unit 0 of the
-   dualtex path (vertex-coloured lightmapped geometry), `GL_DECAL`/`GL_ADD` on
-   unit 1, so it becomes a general two-texture path.
+- **The vertex pipeline is not the problem.** Immediate mode, transform, clip
+  test, lighting and vertex emit together were under 10% of instructions in
+  every workload. No work was done there.
+- **Triangle setup** (`s_tritemp.h`) was 30-35% for small triangles, with no
+  hot line: it is dozens of float->fixed conversions and gradient products
+  spread evenly.
+- **The generic span pipeline** was another third: with about 1.4 spans per
+  triangle, the fixed overhead of `_mesa_write_rgba_span` (mask fill, colour
+  and Z arrays, separate depth pass, driver call) dominates the pixels.
+- Small textured triangles additionally paid two float divides per span in
+  the perspective path.
+
+What was done about it:
+
+1. `IROUND` on m68k is a single `fmove.l` (inline asm in `mmath.h`) instead of
+   test + branch + add + `fintrz`. `FloatToFixed` uses it everywhere. Relies on
+   the default round-to-nearest FPCR mode.
+2. The driver supplies its own untextured triangle functions
+   (`amesa_choose_triangle` in `amiga_mesa_display.c`): flat and smooth, with
+   depth LESS, LEQUAL or no depth test, writing ARGB32 and Z directly. Chosen
+   only when `_RasterMask` is exactly `DEPTH_BIT` or 0; everything else defers
+   to `_swrast_choose_triangle`. Output is bit-identical to swrast's.
+   Gotcha: test `ctx->Color._DrawDestMask == BACK_LEFT_BIT`, not
+   `Color.DrawBuffer`, which is `GL_BACK` by default.
+3. `persp_textured_triangle` is now a front end. If 1/w is the same at all
+   three vertices (any orthographic/2D drawing), or varies so little that the
+   affine error is under about half a pixel
+   (`(wMax - wMin) * extent < 2 * wMin`), it calls
+   `affine_mip_textured_triangle`, whose spans use no floating point; the mip
+   level is chosen once per triangle. Otherwise `persp_textured_triangle_full`.
+4. `fast_persp_span` does a span in one run when q does not change along it.
+
+Measured as m68k code under qemu, 320x240: gears 7.1 -> 4.8 ms, textured
+spheres 160 -> 110, lit spheres 81 -> 67, flat spheres 54 -> 45, blended 2D
+quads 205 -> 93. Lines unchanged. The untextured results are bit-identical;
+the textured ones differ in under 1% of pixels.
+
+## Third round: lines, points, per-vertex colour (done)
+
+Prompted by looking at G-WARS, which is nothing like Quake: 2D, no depth test,
+no blending, no textures; thousands of width-1 `GL_LINES` and `GL_POINTS` per
+frame via `glVertex2i` with one `glColor3fv` per primitive, default (smooth)
+shade model. Two workloads modelled on it were added to `geom`: "2D plain
+lines + points" and "3D wireframe, depth tested".
+
+1. **Direct lines** in the driver (`amesa_choose_line`): flat and smooth,
+   width 1, unstippled, untextured, with depth LESS/LEQUAL or none, plotted
+   straight into the buffer via `s_linetemp.h`. A "smooth" line whose two
+   vertex colours are equal is drawn by the flat function.
+   Do not use `CLIP_HACK`: it moves the end point of a line clipped at the
+   right/top edge and so shifts the whole line. Instead any line with an end
+   point on `x == width` or `y == height` is passed to swrast's own function,
+   saved in `a_ctx->swrast_line` when the line function is chosen.
+2. **Direct size-1 points** (`amesa_choose_point`), bounds-checked for the
+   same edge case.
+3. `amesa_direct_mode()` is the shared "is the state simple enough" test for
+   the driver's triangle, line and point functions.
+4. **Float colour -> byte conversion** (`trans_4_GLfloat_4ub_raw` and the
+   3-component one in `math/m_translate.c`) is hand-written: if a vertex's
+   colour has the same bit pattern as the previous vertex's, the previous
+   result is copied. This was 11% of the plain-lines workload.
+5. **Triangle setup** (`s_tritemp.h`, `smoothRGBA`): with smooth shading and
+   three equal vertex colours the colour gradients are skipped. `smoothBias`
+   keeps the result bit-identical to the smooth path.
+6. `triangle_is_near_affine()` factored out of the perspective front end.
+
+Everything in this round is **byte-identical** to the previous output, in
+both benchmarks, natively and as m68k code.
+
+Native instruction counts (deterministic, init excluded): plain 2D lines and
+points 31.7M -> 15.6M, depth-tested wireframe 18.5M -> 13.1M, lit spheres
+-4%, blended 2D quads -2%. Textured spheres with a different colour at every
+vertex got 1.5% *slower* (the extra colour compares buy nothing there). Under
+qemu the wall-clock gains are much smaller (about 5-10%) because its software
+FPU makes the per-vertex float work dominate lines.
+
+Tried and reverted: applying the near-affine test to `dualtex_span` (whole
+span in one run). No measurable gain in the corridor and it changed about 1%
+of pixels, so it was not kept.
+
+Measuring: wall-clock under qemu on a shared machine was too noisy this round
+(the same binary varied by 30%). Use
+`valgrind --tool=callgrind --callgrind-out-file=/dev/null <bench>` and read
+the "Collected" instruction count for regressions, subtracting an init-only
+run (`ONLY=99`), and take the best of several qemu runs for float-heavy
+direction.
+
+## Ideas not done yet
+
+In rough order of expected value:
+
+- **Per-vertex float work in the vertex pipeline.** After round three this is
+  what is left for line/point-heavy 2D drawing under a slow FPU: modelview and
+  projection transform, clip test, viewport map, and the copy into `SWvertex`.
+  An identity or pure 2D-ortho fast path through transform and clip test is
+  the obvious candidate. Profile before starting; under a fast FPU it is only
+  a few percent.
+- **Triangle setup float work**: compute attribute gradients in fixed point;
+  cull before converting all three vertices.
+- **Blended primitives.** Additive/alpha-blended lines and spans still read
+  the framebuffer into a temporary, blend, and write back. Direct blended
+  variants of the driver functions would cover that.
+- **Wide lines** (`glLineWidth` > 1) go through the general path.
+- **State validation**: every `glBindTexture` sets `_NEW_TEXTURE` and forces
+  the triangle and sampler functions to be re-chosen.
+- **Widen the dualtex path**: `GL_MODULATE` on unit 0, `GL_DECAL`/`GL_ADD` on
+  unit 1.
+- **Clear and swap.** `glClear` copies a pre-filled buffer the size of the
+  screen and the swap copies it again; a fill loop and rendering in the
+  screen's native format would cut memory traffic. Needs measuring on real
+  hardware, not here.
 
 Other ideas noted but deliberately left alone:
 
-- Writing spans straight into the back buffer with an inline 16-bit depth test
-  instead of staging through `GLchan[4]` arrays. Means duplicating fog, blend
-  and masking per path; wants a real profile first.
+- Direct-to-buffer writes for the *textured* paths. Means duplicating fog,
+  blend and masking per path.
 - Sharing the perspective divide between the two units in `dualtex_span` when
   their `q` is identical (it nearly always is).
-- The swap always passes `RGBFB_A8R8G8B8` to `p96WritePixelArray`. If the
-  screen is another 32-bit format, P96 converts every frame; rendering in the
-  screen's own format would avoid that.
 
 ## Application-side notes (from the FitzQuake port)
 
@@ -198,3 +285,6 @@ Useful as an example of how an application's state maps onto the paths above:
 - Sky is drawn flat and then again as two blended layers unless `r_fastsky 1`.
 - Alias models with `gl_overbright_models 1` use single-unit `GL_COMBINE`,
   which is still on the general path.
+
+G-WARS, for contrast, uses only unblended 2D lines, points and a few quads
+with no depth test or textures (see the third round above).

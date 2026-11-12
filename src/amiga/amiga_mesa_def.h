@@ -16,6 +16,7 @@ struct amigamesa_context {
 	GLubyte *back_buffer; /* Pixel buffer */
 	GLuint **row; /* NOVA: back_buffer row pointers, y-flip already applied */
 	struct Window *hardware_window; /* Intuition window */
+	void (*swrast_line)(void); /* NOVA: swrast's own line function for the current state (a swrast_line_func) */
 };
 
 #endif

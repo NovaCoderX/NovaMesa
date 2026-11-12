@@ -44,6 +44,7 @@
 #include "swrast/s_context.h"
 #include "swrast/s_depth.h"
 #include "swrast/s_lines.h"
+#include "swrast/s_points.h"
 #include "swrast/s_triangle.h"
 #include "swrast/s_trispan.h"
 #include "tnl/tnl.h"
@@ -350,6 +351,412 @@ static void read_rgba_pixels(const GLcontext* gl_ctx, GLuint n, const GLint x[],
 	}
 }
 
+/**********************************************************************/
+/* NOVA: untextured triangles drawn straight into the back buffer      */
+/**********************************************************************/
+
+/*
+ * swrast's flat_rgba_triangle / smooth_rgba_triangle push every span through
+ * the general span pipeline: fill a mask, interpolate colour and Z into
+ * arrays, depth test the arrays, then call the driver to copy the survivors
+ * into the buffer.  For big spans that overhead is spread thin, but for small
+ * triangles (a span or two each) it is most of the cost.
+ *
+ * When the state is simple enough -- no texture, blending, fog, stencil,
+ * masking, stipple or scissor -- these do the depth test and the pixel write
+ * inline instead.  This is the same thing Mesa's own OSMesa and X11 drivers
+ * do.  amesa_choose_triangle() picks one of them when it can and otherwise
+ * defers to swrast.
+ */
+
+#define FIXED_TO_ARGB32(r, g, b, a) \
+	TC_ARGB32((GLuint) FixedToInt(r), (GLuint) FixedToInt(g), (GLuint) FixedToInt(b), (GLuint) FixedToInt(a))
+
+#define AMESA_TRI_COMMON \
+	AMesaContext* a_ctx = (AMesaContext*) ctx->DriverCtx;
+
+/* Smooth shaded, depth tested with ZTEST. */
+#define AMESA_SMOOTH_Z_SPAN(ZTEST) \
+	GLuint i; \
+	for (i = 0; i < span.end; i++) { \
+		const GLdepth z = FixedToDepth(span.z); \
+		if (z ZTEST zRow[i]) { \
+			pRow[i] = FIXED_TO_ARGB32(span.red, span.green, span.blue, span.alpha); \
+			zRow[i] = z; \
+		} \
+		span.red += span.redStep; \
+		span.green += span.greenStep; \
+		span.blue += span.blueStep; \
+		span.alpha += span.alphaStep; \
+		span.z += span.zStep; \
+	}
+
+static void smooth_z_less_triangle(GLcontext* ctx, const SWvertex* v0, const SWvertex* v1, const SWvertex* v2) {
+	AMESA_TRI_COMMON
+#define INTERP_Z 1
+#define DEPTH_TYPE DEFAULT_SOFTWARE_DEPTH_TYPE
+#define INTERP_RGB 1
+#define INTERP_ALPHA 1
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define RENDER_SPAN(span) AMESA_SMOOTH_Z_SPAN(<)
+#include "swrast/s_tritemp.h"
+}
+
+static void smooth_z_lequal_triangle(GLcontext* ctx, const SWvertex* v0, const SWvertex* v1, const SWvertex* v2) {
+	AMESA_TRI_COMMON
+#define INTERP_Z 1
+#define DEPTH_TYPE DEFAULT_SOFTWARE_DEPTH_TYPE
+#define INTERP_RGB 1
+#define INTERP_ALPHA 1
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define RENDER_SPAN(span) AMESA_SMOOTH_Z_SPAN(<=)
+#include "swrast/s_tritemp.h"
+}
+
+/* Flat shaded, depth tested. The colour comes from the provoking vertex. */
+#define AMESA_FLAT_Z_SPAN(ZTEST) \
+	GLuint i; \
+	for (i = 0; i < span.end; i++) { \
+		const GLdepth z = FixedToDepth(span.z); \
+		if (z ZTEST zRow[i]) { \
+			pRow[i] = pixel; \
+			zRow[i] = z; \
+		} \
+		span.z += span.zStep; \
+	}
+
+static void flat_z_less_triangle(GLcontext* ctx, const SWvertex* v0, const SWvertex* v1, const SWvertex* v2) {
+	AMESA_TRI_COMMON
+#define INTERP_Z 1
+#define DEPTH_TYPE DEFAULT_SOFTWARE_DEPTH_TYPE
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define SETUP_CODE \
+	const GLuint pixel = TC_ARGB32(v2->color[RCOMP], v2->color[GCOMP], v2->color[BCOMP], v2->color[ACOMP]);
+#define RENDER_SPAN(span) AMESA_FLAT_Z_SPAN(<)
+#include "swrast/s_tritemp.h"
+}
+
+static void flat_z_lequal_triangle(GLcontext* ctx, const SWvertex* v0, const SWvertex* v1, const SWvertex* v2) {
+	AMESA_TRI_COMMON
+#define INTERP_Z 1
+#define DEPTH_TYPE DEFAULT_SOFTWARE_DEPTH_TYPE
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define SETUP_CODE \
+	const GLuint pixel = TC_ARGB32(v2->color[RCOMP], v2->color[GCOMP], v2->color[BCOMP], v2->color[ACOMP]);
+#define RENDER_SPAN(span) AMESA_FLAT_Z_SPAN(<=)
+#include "swrast/s_tritemp.h"
+}
+
+/* No depth test at all (2D drawing). */
+static void smooth_triangle(GLcontext* ctx, const SWvertex* v0, const SWvertex* v1, const SWvertex* v2) {
+	AMESA_TRI_COMMON
+#define INTERP_RGB 1
+#define INTERP_ALPHA 1
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define RENDER_SPAN(span) \
+	GLuint i; \
+	for (i = 0; i < span.end; i++) { \
+		pRow[i] = FIXED_TO_ARGB32(span.red, span.green, span.blue, span.alpha); \
+		span.red += span.redStep; \
+		span.green += span.greenStep; \
+		span.blue += span.blueStep; \
+		span.alpha += span.alphaStep; \
+	}
+#include "swrast/s_tritemp.h"
+}
+
+static void flat_triangle(GLcontext* ctx, const SWvertex* v0, const SWvertex* v1, const SWvertex* v2) {
+	AMESA_TRI_COMMON
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define SETUP_CODE \
+	const GLuint pixel = TC_ARGB32(v2->color[RCOMP], v2->color[GCOMP], v2->color[BCOMP], v2->color[ACOMP]);
+#define RENDER_SPAN(span) \
+	GLuint i; \
+	for (i = 0; i < span.end; i++) { \
+		pRow[i] = pixel; \
+	}
+#include "swrast/s_tritemp.h"
+}
+
+/**********************************************************************/
+/* NOVA: untextured lines and points drawn straight into the buffer    */
+/**********************************************************************/
+
+/*
+ * Same idea as the triangles above.  swrast's line functions collect every
+ * pixel's x and y into arrays and hand them to the general span pipeline,
+ * which then clips, (optionally) depth tests and finally calls the driver's
+ * WriteRGBAPixels -- several passes over arrays for what is one store per
+ * pixel.  Width-1, unstippled, untextured lines with nothing else enabled
+ * are plotted directly instead.
+ *
+ * A line clipped against the right or top of the view volume ends exactly on
+ * x == width or y == height, one pixel outside the buffer.  swrast draws such
+ * a line in full and discards the stray pixel; s_linetemp.h's CLIP_HACK
+ * instead moves the end point, which shifts the whole line slightly.  To stay
+ * pixel-exact those few lines are handed back to swrast's own function.
+ */
+#define AMESA_LINE_COMMON \
+	AMesaContext* a_ctx = (AMesaContext*) ctx->DriverCtx; \
+	if ((GLuint) (GLint) vert0->win[0] >= a_ctx->width || (GLuint) (GLint) vert1->win[0] >= a_ctx->width \
+			|| (GLuint) (GLint) vert0->win[1] >= a_ctx->height || (GLuint) (GLint) vert1->win[1] >= a_ctx->height) { \
+		((swrast_line_func) a_ctx->swrast_line)(ctx, vert0, vert1); \
+		return; \
+	}
+
+#define AMESA_SAME_COLOR(v0, v1) \
+	((v0)->color[0] == (v1)->color[0] && (v0)->color[1] == (v1)->color[1] && \
+	 (v0)->color[2] == (v1)->color[2] && (v0)->color[3] == (v1)->color[3])
+
+static void flat_line(GLcontext* ctx, const SWvertex* vert0, const SWvertex* vert1) {
+	AMESA_LINE_COMMON
+	const GLuint pixel = TC_ARGB32(vert1->color[RCOMP], vert1->color[GCOMP], vert1->color[BCOMP], vert1->color[ACOMP]);
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define PLOT(X, Y) *pixelPtr = pixel;
+#include "swrast/s_linetemp.h"
+}
+
+static void smooth_line(GLcontext* ctx, const SWvertex* vert0, const SWvertex* vert1) {
+	AMESA_LINE_COMMON
+	// Smooth shading is the GL default, so most "smooth" lines are really one colour.
+	if (AMESA_SAME_COLOR(vert0, vert1)) {
+		flat_line(ctx, vert0, vert1);
+		return;
+	}
+#define INTERP_RGB 1
+#define INTERP_ALPHA 1
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define PLOT(X, Y) *pixelPtr = FIXED_TO_ARGB32(r0, g0, b0, a0);
+#include "swrast/s_linetemp.h"
+}
+
+static void flat_z_less_line(GLcontext* ctx, const SWvertex* vert0, const SWvertex* vert1) {
+	AMESA_LINE_COMMON
+	const GLuint pixel = TC_ARGB32(vert1->color[RCOMP], vert1->color[GCOMP], vert1->color[BCOMP], vert1->color[ACOMP]);
+#define INTERP_Z 1
+#define DEPTH_TYPE DEFAULT_SOFTWARE_DEPTH_TYPE
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define PLOT(X, Y) if (Z < *zPtr) { *zPtr = Z; *pixelPtr = pixel; }
+#include "swrast/s_linetemp.h"
+}
+
+static void flat_z_lequal_line(GLcontext* ctx, const SWvertex* vert0, const SWvertex* vert1) {
+	AMESA_LINE_COMMON
+	const GLuint pixel = TC_ARGB32(vert1->color[RCOMP], vert1->color[GCOMP], vert1->color[BCOMP], vert1->color[ACOMP]);
+#define INTERP_Z 1
+#define DEPTH_TYPE DEFAULT_SOFTWARE_DEPTH_TYPE
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define PLOT(X, Y) if (Z <= *zPtr) { *zPtr = Z; *pixelPtr = pixel; }
+#include "swrast/s_linetemp.h"
+}
+
+static void smooth_z_less_line(GLcontext* ctx, const SWvertex* vert0, const SWvertex* vert1) {
+	AMESA_LINE_COMMON
+	if (AMESA_SAME_COLOR(vert0, vert1)) {
+		flat_z_less_line(ctx, vert0, vert1);
+		return;
+	}
+#define INTERP_Z 1
+#define DEPTH_TYPE DEFAULT_SOFTWARE_DEPTH_TYPE
+#define INTERP_RGB 1
+#define INTERP_ALPHA 1
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define PLOT(X, Y) if (Z < *zPtr) { *zPtr = Z; *pixelPtr = FIXED_TO_ARGB32(r0, g0, b0, a0); }
+#include "swrast/s_linetemp.h"
+}
+
+static void smooth_z_lequal_line(GLcontext* ctx, const SWvertex* vert0, const SWvertex* vert1) {
+	AMESA_LINE_COMMON
+	if (AMESA_SAME_COLOR(vert0, vert1)) {
+		flat_z_lequal_line(ctx, vert0, vert1);
+		return;
+	}
+#define INTERP_Z 1
+#define DEPTH_TYPE DEFAULT_SOFTWARE_DEPTH_TYPE
+#define INTERP_RGB 1
+#define INTERP_ALPHA 1
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define PLOT(X, Y) if (Z <= *zPtr) { *zPtr = Z; *pixelPtr = FIXED_TO_ARGB32(r0, g0, b0, a0); }
+#include "swrast/s_linetemp.h"
+}
+
+/*
+ * Is the state simple enough for the direct line/point/triangle functions?
+ * Returns 0 if not, 1 for "no depth test", 2 for depth LESS, 3 for LEQUAL.
+ */
+static GLint amesa_direct_mode(const GLcontext* ctx) {
+	const SWcontext* swrast = SWRAST_CONTEXT(ctx);
+
+	if (ctx->RenderMode != GL_RENDER
+			|| ctx->Texture._EnabledUnits != 0
+			|| ctx->Visual.depthBits != DEFAULT_SOFTWARE_DEPTH_BITS
+			|| ctx->Color._DrawDestMask != BACK_LEFT_BIT) {
+		return 0;
+	}
+
+	if (swrast->_RasterMask == 0) {
+		return 1;
+	}
+
+	if (swrast->_RasterMask == DEPTH_BIT && ctx->Depth.Mask == GL_TRUE && ctx->DrawBuffer->DepthBuffer) {
+		if (ctx->Depth.Func == GL_LESS) {
+			return 2;
+		}
+		if (ctx->Depth.Func == GL_LEQUAL) {
+			return 3;
+		}
+	}
+
+	return 0;
+}
+
+static void amesa_choose_line(GLcontext* ctx) {
+	SWcontext* swrast = SWRAST_CONTEXT(ctx);
+
+	// Let swrast choose first: its function is the fallback for edge lines.
+	_swrast_choose_line(ctx);
+	((AMesaContext*) ctx->DriverCtx)->swrast_line = (void (*)(void)) swrast->Line;
+
+	if (!ctx->Line.SmoothFlag && !ctx->Line.StippleFlag && ctx->Line.Width == 1.0F) {
+		const GLboolean smooth = (ctx->Light.ShadeModel == GL_SMOOTH);
+
+		switch (amesa_direct_mode(ctx)) {
+			case 1:
+				swrast->Line = smooth ? smooth_line : flat_line;
+				return;
+			case 2:
+				swrast->Line = smooth ? smooth_z_less_line : flat_z_less_line;
+				return;
+			case 3:
+				swrast->Line = smooth ? smooth_z_lequal_line : flat_z_lequal_line;
+				return;
+			default:
+				break;
+		}
+	}
+}
+
+/*
+ * Single-pixel points.  swrast batches these into a span and runs the general
+ * pipeline over it; this is one bounds check and one store.  The bounds check
+ * is needed because a point on the right or top edge of the view volume maps
+ * to x == width or y == height.
+ */
+static void size1_point(GLcontext* ctx, const SWvertex* vert) {
+	AMesaContext* a_ctx = (AMesaContext*) ctx->DriverCtx;
+	const GLfloat tmp = vert->win[0] + vert->win[1];
+
+	if (!IS_INF_OR_NAN(tmp)) {
+		const GLint x = (GLint) vert->win[0];
+		const GLint y = (GLint) vert->win[1];
+
+		if ((GLuint) x < a_ctx->width && (GLuint) y < a_ctx->height) {
+			a_ctx->row[y][x] = TC_ARGB32(vert->color[RCOMP], vert->color[GCOMP], vert->color[BCOMP], vert->color[ACOMP]);
+		}
+	}
+}
+
+static void size1_z_point(GLcontext* ctx, const SWvertex* vert) {
+	AMesaContext* a_ctx = (AMesaContext*) ctx->DriverCtx;
+	const GLfloat tmp = vert->win[0] + vert->win[1];
+
+	if (!IS_INF_OR_NAN(tmp)) {
+		const GLint x = (GLint) vert->win[0];
+		const GLint y = (GLint) vert->win[1];
+
+		if ((GLuint) x < a_ctx->width && (GLuint) y < a_ctx->height) {
+			DEFAULT_SOFTWARE_DEPTH_TYPE* zPtr = (DEFAULT_SOFTWARE_DEPTH_TYPE*) ctx->DrawBuffer->DepthBuffer + ctx->DrawBuffer->Width * y + x;
+			const GLdepth z = (GLdepth) (GLint) vert->win[2];
+			const GLboolean pass = (ctx->Depth.Func == GL_LESS) ? (z < *zPtr) : (z <= *zPtr);
+
+			if (pass) {
+				*zPtr = (DEFAULT_SOFTWARE_DEPTH_TYPE) z;
+				a_ctx->row[y][x] = TC_ARGB32(vert->color[RCOMP], vert->color[GCOMP], vert->color[BCOMP], vert->color[ACOMP]);
+			}
+		}
+	}
+}
+
+static void amesa_choose_point(GLcontext* ctx) {
+	SWcontext* swrast = SWRAST_CONTEXT(ctx);
+
+	if (ctx->Point.Size == 1.0F
+			&& !ctx->Point.SmoothFlag
+			&& !ctx->Point._Attenuated
+			&& !ctx->Point.PointSprite
+			&& !ctx->VertexProgram.PointSizeEnabled) {
+		const GLint mode = amesa_direct_mode(ctx);
+
+		if (mode == 1) {
+			swrast->Point = size1_point;
+			return;
+		}
+		if (mode == 2 || mode == 3) {
+			swrast->Point = size1_z_point;
+			return;
+		}
+	}
+
+	_swrast_choose_point(ctx);
+}
+
+/*
+ * Pick a triangle function. Anything not handled above is left to swrast.
+ */
+static void amesa_choose_triangle(GLcontext* ctx) {
+	SWcontext* swrast = SWRAST_CONTEXT(ctx);
+
+	if (ctx->RenderMode == GL_RENDER
+			&& !ctx->Polygon.SmoothFlag
+			&& !ctx->Polygon.StippleFlag
+			&& !(ctx->Polygon.CullFlag && ctx->Polygon.CullFaceMode == GL_FRONT_AND_BACK)
+			&& ctx->Texture._EnabledUnits == 0
+			&& ctx->Visual.depthBits == DEFAULT_SOFTWARE_DEPTH_BITS
+			&& ctx->Color._DrawDestMask == BACK_LEFT_BIT) {
+		const GLboolean smooth = (ctx->Light.ShadeModel == GL_SMOOTH);
+
+		if (swrast->_RasterMask == DEPTH_BIT && ctx->Depth.Mask == GL_TRUE && ctx->DrawBuffer->DepthBuffer) {
+			if (ctx->Depth.Func == GL_LESS) {
+				swrast->Triangle = smooth ? smooth_z_less_triangle : flat_z_less_triangle;
+				return;
+			}
+			if (ctx->Depth.Func == GL_LEQUAL) {
+				swrast->Triangle = smooth ? smooth_z_lequal_triangle : flat_z_lequal_triangle;
+				return;
+			}
+		} else if (swrast->_RasterMask == 0) {
+			swrast->Triangle = smooth ? smooth_triangle : flat_triangle;
+			return;
+		}
+	}
+
+	_swrast_choose_triangle(ctx);
+}
+
 // Setup pointers and other driver state that is constant for the life of a context.
 static void amesa_display_init_pointers(GLcontext* gl_ctx) {
 	struct swrast_device_driver* swdd = _swrast_GetDeviceDriverReference(gl_ctx);
@@ -397,6 +804,11 @@ static void amesa_display_init_pointers(GLcontext* gl_ctx) {
 	gl_ctx->Driver.CopyColorSubTable = _swrast_CopyColorSubTable;
 	gl_ctx->Driver.CopyConvolutionFilter1D = _swrast_CopyConvolutionFilter1D;
 	gl_ctx->Driver.CopyConvolutionFilter2D = _swrast_CopyConvolutionFilter2D;
+
+	// NOVA: let the driver offer its own direct-to-buffer triangle functions.
+	SWRAST_CONTEXT(gl_ctx)->choose_triangle = amesa_choose_triangle;
+	SWRAST_CONTEXT(gl_ctx)->choose_line = amesa_choose_line;
+	SWRAST_CONTEXT(gl_ctx)->choose_point = amesa_choose_point;
 
 	swdd->SetBuffer = set_buffer;
 

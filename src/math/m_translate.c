@@ -444,7 +444,6 @@ static trans_4f_func  _math_trans_4f_tab[5][MAX_TYPES];
 #define SRC_IDX TYPE_IDX(GL_FLOAT)
 #define SZ 4
 #define INIT init_trans_4_GLfloat_raw
-#define DEST_4UB trans_4_GLfloat_4ub_raw
 #define DEST_4US trans_4_GLfloat_4us_raw
 #define DEST_4F  trans_4_GLfloat_4f_raw
 #include "m_trans_tmp.h"
@@ -452,7 +451,6 @@ static trans_4f_func  _math_trans_4f_tab[5][MAX_TYPES];
 #define SZ 3
 #define INIT init_trans_3_GLfloat_raw
 #define DEST_4F  trans_3_GLfloat_4f_raw
-#define DEST_4UB trans_3_GLfloat_4ub_raw
 #define DEST_4US trans_3_GLfloat_4us_raw
 #define DEST_3F trans_3_GLfloat_3f_raw
 #include "m_trans_tmp.h"
@@ -505,6 +503,70 @@ static void trans_4_GLubyte_4ub_raw(GLubyte (*t)[4],
 }
 
 
+/* NOVA: GLfloat colours -> GLubyte, written out by hand instead of through
+ * m_trans_tmp.h.
+ *
+ * Colours set with glColor3f/4f are kept as floats and converted to bytes for
+ * every vertex when the rasteriser's vertices are built -- four float
+ * multiply-adds and float->int moves each.  But an application normally sets
+ * a colour once and then emits many vertices, so consecutive elements are
+ * usually bit-for-bit the same.  Comparing the raw bits with the previous
+ * element is four integer compares, and a match just copies the previous
+ * result.  Vertices whose colours really do differ pay only for the compares.
+ */
+static void
+trans_4_GLfloat_4ub_raw( GLubyte (*t)[4], CONST void *ptr, GLuint stride,
+                         GLuint start, GLuint n )
+{
+   const GLubyte *f = (const GLubyte *) ptr + start * stride;
+   GLint p0 = 0, p1 = 0, p2 = 0, p3 = 0;
+   GLuint i;
+
+   for (i = 0; i < n; i++, f += stride) {
+      const fi_type *src = (const fi_type *) f;
+      if (i > 0 && src[0].i == p0 && src[1].i == p1
+                && src[2].i == p2 && src[3].i == p3) {
+         t[i][0] = t[i-1][0];
+         t[i][1] = t[i-1][1];
+         t[i][2] = t[i-1][2];
+         t[i][3] = t[i-1][3];
+      }
+      else {
+         p0 = src[0].i;  p1 = src[1].i;  p2 = src[2].i;  p3 = src[3].i;
+         UNCLAMPED_FLOAT_TO_UBYTE(t[i][0], src[0].f);
+         UNCLAMPED_FLOAT_TO_UBYTE(t[i][1], src[1].f);
+         UNCLAMPED_FLOAT_TO_UBYTE(t[i][2], src[2].f);
+         UNCLAMPED_FLOAT_TO_UBYTE(t[i][3], src[3].f);
+      }
+   }
+}
+
+static void
+trans_3_GLfloat_4ub_raw( GLubyte (*t)[4], CONST void *ptr, GLuint stride,
+                         GLuint start, GLuint n )
+{
+   const GLubyte *f = (const GLubyte *) ptr + start * stride;
+   GLint p0 = 0, p1 = 0, p2 = 0;
+   GLuint i;
+
+   for (i = 0; i < n; i++, f += stride) {
+      const fi_type *src = (const fi_type *) f;
+      if (i > 0 && src[0].i == p0 && src[1].i == p1 && src[2].i == p2) {
+         t[i][0] = t[i-1][0];
+         t[i][1] = t[i-1][1];
+         t[i][2] = t[i-1][2];
+      }
+      else {
+         p0 = src[0].i;  p1 = src[1].i;  p2 = src[2].i;
+         UNCLAMPED_FLOAT_TO_UBYTE(t[i][0], src[0].f);
+         UNCLAMPED_FLOAT_TO_UBYTE(t[i][1], src[1].f);
+         UNCLAMPED_FLOAT_TO_UBYTE(t[i][2], src[2].f);
+      }
+      t[i][3] = 255;
+   }
+}
+
+
 static void init_translate_raw(void)
 {
    MEMSET( TAB(_1ui), 0, sizeof(TAB(_1ui)) );
@@ -543,6 +605,9 @@ static void init_translate_raw(void)
    init_trans_1_GLdouble_raw();
    init_trans_4_GLfloat_raw();
    init_trans_3_GLfloat_raw();
+   /* NOVA: hand-written versions, see above */
+   TAB(_4ub)[4][TYPE_IDX(GL_FLOAT)] = trans_4_GLfloat_4ub_raw;
+   TAB(_4ub)[3][TYPE_IDX(GL_FLOAT)] = trans_3_GLfloat_4ub_raw;
    init_trans_2_GLfloat_raw();
    init_trans_1_GLfloat_raw();
 

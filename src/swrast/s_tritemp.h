@@ -120,6 +120,24 @@
 
    struct sw_span span;
 
+#ifdef INTERP_RGB
+   /* NOVA: smooth shading is the GL default, so plenty of geometry is "smooth"
+    * with the same colour at all three vertices (anything drawn after a single
+    * glColor call: textured polygons, 2D quads, ...).  Its colour gradients are
+    * zero, yet working that out costs dozens of float operations per triangle.
+    * Spot it up front and treat the colour as constant.  The result is
+    * identical: smoothBias keeps the half-unit rounding the smooth path adds.
+    */
+   const GLboolean smoothRGBA =
+      (ctx->Light.ShadeModel == GL_SMOOTH
+       && !(v0->color[0] == v1->color[0] && v0->color[0] == v2->color[0] &&
+            v0->color[1] == v1->color[1] && v0->color[1] == v2->color[1] &&
+            v0->color[2] == v1->color[2] && v0->color[2] == v2->color[2] &&
+            v0->color[3] == v1->color[3] && v0->color[3] == v2->color[3]));
+   const GLfixed smoothBias =
+      (ctx->Light.ShadeModel == GL_SMOOTH) ? FIXED_HALF : 0;
+#endif
+
    INIT_SPAN(span, GL_POLYGON, 0, 0, 0);
 
 #ifdef INTERP_Z
@@ -371,7 +389,7 @@
 #endif
 #ifdef INTERP_RGB
       span.interpMask |= SPAN_RGBA;
-      if (ctx->Light.ShadeModel == GL_SMOOTH) {
+      if (smoothRGBA) {
          GLfloat eMaj_dr, eBot_dr;
          GLfloat eMaj_dg, eBot_dg;
          GLfloat eMaj_db, eBot_db;
@@ -410,7 +428,6 @@
 #  endif
       }
       else {
-         ASSERT (ctx->Light.ShadeModel == GL_FLAT);
          span.interpMask |= SPAN_FLAT;
          drdx = drdy = 0.0F;
          dgdx = dgdy = 0.0F;
@@ -888,7 +905,7 @@
                dfogOuter = dfogdy + dxOuter * span.fogStep;
 #endif
 #ifdef INTERP_RGB
-               if (ctx->Light.ShadeModel == GL_SMOOTH) {
+               if (smoothRGBA) {
                   fr = (GLfixed) (ChanToFixed(vLower->color[RCOMP])
                                    + drdx * adjx + drdy * adjy) + FIXED_HALF;
                   fdrOuter = SignedFloatToFixed(drdy + dxOuter * drdx);
@@ -905,13 +922,12 @@
 #  endif
                }
                else {
-                  ASSERT (ctx->Light.ShadeModel == GL_FLAT);
-                  fr = ChanToFixed(v2->color[RCOMP]);
-                  fg = ChanToFixed(v2->color[GCOMP]);
-                  fb = ChanToFixed(v2->color[BCOMP]);
+                  fr = ChanToFixed(v2->color[RCOMP]) + smoothBias;
+                  fg = ChanToFixed(v2->color[GCOMP]) + smoothBias;
+                  fb = ChanToFixed(v2->color[BCOMP]) + smoothBias;
                   fdrOuter = fdgOuter = fdbOuter = 0;
 #  ifdef INTERP_ALPHA
-                  fa =  ChanToFixed(v2->color[ACOMP]);
+                  fa =  ChanToFixed(v2->color[ACOMP]) + smoothBias;
                   fdaOuter = 0;
 #  endif
                }
