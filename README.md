@@ -7,7 +7,7 @@ For performance reasons, only 32-bit displays are supported and the only practic
 
 ## Performance
 
-Stock Mesa 4.1 does most of its texturing in floating point per pixel, which is very slow on a 68k FPU. NovaMesa adds fixed-point paths for the common cases:
+Stock Mesa 4.1 does most of its texturing in floating point per pixel, which can be very slow on a 68k FPU. NovaMesa adds fixed-point paths for the common cases:
 
 - single texture, perspective correct, with nearest, bilinear or mipmap-nearest filtering
 - two textures (texture on unit 0 with `GL_REPLACE`, lightmap on unit 1 with `GL_MODULATE` or a scaled `GL_COMBINE` modulate)
