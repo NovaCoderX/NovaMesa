@@ -364,6 +364,8 @@ struct affine_info
    const struct gl_texture_object *obj;   /* perspective path only */
    GLint maxLevel;                        /* perspective path only: highest
                                            * mip level usable above BaseLevel */
+   GLint level;                           /* affine_mip_span(): level chosen
+                                           * for this triangle, -1 = not yet */
 };
 
 
@@ -761,7 +763,12 @@ fast_persp_span(GLcontext *ctx, struct sw_span *span,
    tFix = (GLfixed) ((tTex - tBias) * FIXED_SCALE);
 
    while (left > 0) {
-      const GLuint n = (left > PERSP_SUBDIV) ? PERSP_SUBDIV : left;
+      /* With no change in q along the span (orthographic projection, or a
+       * polygon facing the viewer) the mapping is already linear, so the
+       * whole span can be done in one run.
+       */
+      const GLuint n = (left > PERSP_SUBDIV && hqStep != 0.0F)
+                     ? PERSP_SUBDIV : left;
       GLfixed sEnd, tEnd, sStep, tStep;
       GLint level = 0;
 
@@ -840,7 +847,7 @@ fast_persp_span(GLcontext *ctx, struct sw_span *span,
  * by interpolated Q/W comes out right.
  *
  */
-static void persp_textured_triangle( GLcontext *ctx,
+static void persp_textured_triangle_full( GLcontext *ctx,
 				     const SWvertex *v0,
 				     const SWvertex *v1,
 				     const SWvertex *v2 )
@@ -909,6 +916,185 @@ static void persp_textured_triangle( GLcontext *ctx,
 
 #include "s_tritemp.h"
 
+}
+
+
+/*
+ * NOVA: affine span for a triangle that may be mipmapped.  The level is the
+ * same for the whole triangle and is worked out on its first span from the
+ * texcoord gradients s_tritemp.h has already computed (in base-level texels
+ * per pixel).  After that a span costs no floating point at all.
+ */
+static INLINE void
+affine_mip_span(GLcontext *ctx, struct sw_span *span, struct affine_info *info,
+                GLfloat dsdx, GLfloat dsdy, GLfloat dtdx, GLfloat dtdy)
+{
+   if (info->zReject && span_hidden(ctx, span))
+      return;
+
+   if (info->level < 0) {
+      GLint level = 0;
+      if (info->maxLevel > 0) {
+         const GLfloat ax = FABSF(dsdx), ay = FABSF(dsdy);
+         const GLfloat bx = FABSF(dtdx), by = FABSF(dtdy);
+         const GLfloat maxU = MAX2(ax, ay);
+         const GLfloat maxV = MAX2(bx, by);
+         const GLfloat rho = MAX2(maxU, maxV);
+         GLfloat threshold = 1.41421356F;
+         while (level < info->maxLevel && rho > threshold) {
+            level++;
+            threshold *= 2.0F;
+         }
+         if (level > 0) {
+            const struct gl_texture_image *img =
+               info->obj->Image[info->obj->BaseLevel + level];
+            const GLint comps = (info->format == GL_RGBA) ? 4 : 3;
+            info->texture = (const GLchan *) img->Data;
+            info->twidth_log2 = img->WidthLog2;
+            info->smask = img->Width - 1;
+            info->tmask = img->Height - 1;
+            info->tbytesline = img->Width * comps;
+            info->tsize = img->Height * info->tbytesline;
+         }
+      }
+      info->level = level;
+   }
+
+   if (info->level > 0) {
+      /* s_tritemp.h hands us base-level coordinates with a half-texel bias;
+       * move them to the chosen level and put the bias back for affine_fill().
+       */
+      const GLint level = info->level;
+      const GLfixed sStep = span->intTexStep[0], tStep = span->intTexStep[1];
+      span->intTex[0] = ((span->intTex[0] - FIXED_HALF) >> level) + FIXED_HALF;
+      span->intTex[1] = ((span->intTex[1] - FIXED_HALF) >> level) + FIXED_HALF;
+      span->intTexStep[0] = sStep >> level;
+      span->intTexStep[1] = tStep >> level;
+      affine_fill(span, info, span->array->rgba[0], span->end);
+      span->intTexStep[0] = sStep;
+      span->intTexStep[1] = tStep;
+   }
+   else {
+      affine_fill(span, info, span->array->rgba[0], span->end);
+   }
+
+   span->interpMask &= ~SPAN_RGBA;
+   ASSERT(span->arrayMask & SPAN_RGBA);
+   _mesa_write_rgba_span(ctx, span);
+}
+
+
+/*
+ * As affine_textured_triangle(), but copes with *_MIPMAP_NEAREST.
+ */
+static void affine_mip_textured_triangle( GLcontext *ctx,
+                                          const SWvertex *v0,
+                                          const SWvertex *v1,
+                                          const SWvertex *v2 )
+{
+#define INTERP_Z 1
+#define INTERP_FOG 1
+#define DEPTH_TYPE DEFAULT_SOFTWARE_DEPTH_TYPE
+#define INTERP_RGB 1
+#define INTERP_ALPHA 1
+#define INTERP_INT_TEX 1
+#define S_SCALE twidth
+#define T_SCALE theight
+
+#define SETUP_CODE							\
+   struct affine_info info;						\
+   struct gl_texture_unit *unit = ctx->Texture.Unit+0;			\
+   struct gl_texture_object *obj = unit->Current2D;			\
+   const GLint b = obj->BaseLevel;					\
+   const GLfloat twidth = (GLfloat) obj->Image[b]->Width;		\
+   const GLfloat theight = (GLfloat) obj->Image[b]->Height;		\
+   info.texture = (const GLchan *) obj->Image[b]->Data;			\
+   info.twidth_log2 = obj->Image[b]->WidthLog2;				\
+   info.smask = obj->Image[b]->Width - 1;				\
+   info.tmask = obj->Image[b]->Height - 1;				\
+   info.format = obj->Image[b]->Format;					\
+   info.filter = obj->MagFilter;					\
+   info.envmode = unit->EnvMode;					\
+   info.zReject = span_zreject_ok(ctx);					\
+   info.obj = obj;							\
+   info.maxLevel = (obj->MinFilter == obj->MagFilter)			\
+                 ? 0 : (obj->_MaxLevel - obj->BaseLevel);		\
+   info.level = -1;							\
+   span.arrayMask |= SPAN_RGBA;						\
+									\
+   if (info.envmode == GL_BLEND) {					\
+      info.er = FloatToFixed(unit->EnvColor[RCOMP] * CHAN_MAXF);	\
+      info.eg = FloatToFixed(unit->EnvColor[GCOMP] * CHAN_MAXF);	\
+      info.eb = FloatToFixed(unit->EnvColor[BCOMP] * CHAN_MAXF);	\
+      info.ea = FloatToFixed(unit->EnvColor[ACOMP] * CHAN_MAXF);	\
+   }									\
+   if (!info.texture) {							\
+      /* this shouldn't happen */					\
+      return;								\
+   }									\
+   info.tbytesline = obj->Image[b]->Width				\
+                   * ((info.format == GL_RGBA) ? 4 : 3);		\
+   info.tsize = obj->Image[b]->Height * info.tbytesline;
+
+#define RENDER_SPAN( span )						\
+   affine_mip_span(ctx, &span, &info, dsdx, dsdy, dtdx, dtdy);
+
+#include "s_tritemp.h"
+
+}
+
+
+/*
+ * NOVA: perspective-correct textured triangle, front end.
+ *
+ * Perspective correction only matters when 1/w differs noticeably between
+ * the vertices.  For 2D/orthographic drawing it is constant, and for small
+ * or distant triangles it barely changes; in both cases plain affine
+ * interpolation lands within a fraction of a pixel of the correct result and
+ * needs no per-span floating point.  The test below bounds the screen-space
+ * error (roughly a quarter of the relative change in w times the triangle's
+ * size) to about half a pixel; anything larger takes the real perspective
+ * path.
+ */
+static void persp_textured_triangle( GLcontext *ctx,
+				     const SWvertex *v0,
+				     const SWvertex *v1,
+				     const SWvertex *v2 )
+{
+   const GLfloat w0 = v0->win[3], w1 = v1->win[3], w2 = v2->win[3];
+   GLfloat wMin = w0, wMax = w0;
+
+   if (w1 < wMin) wMin = w1; else if (w1 > wMax) wMax = w1;
+   if (w2 < wMin) wMin = w2; else if (w2 > wMax) wMax = w2;
+
+   if (wMin > 0.0F
+       && v0->texcoord[0][3] == 1.0F
+       && v1->texcoord[0][3] == 1.0F
+       && v2->texcoord[0][3] == 1.0F) {
+      GLboolean affine = (wMin == wMax);
+      if (!affine) {
+         /* largest extent of the triangle on screen, in pixels */
+         const GLfloat ax = FABSF(v1->win[0] - v0->win[0]);
+         const GLfloat bx = FABSF(v2->win[0] - v0->win[0]);
+         const GLfloat cx = FABSF(v2->win[0] - v1->win[0]);
+         const GLfloat ay = FABSF(v1->win[1] - v0->win[1]);
+         const GLfloat by = FABSF(v2->win[1] - v0->win[1]);
+         const GLfloat cy = FABSF(v2->win[1] - v1->win[1]);
+         GLfloat extent = MAX2(ax, bx);
+         extent = MAX2(extent, cx);
+         extent = MAX2(extent, ay);
+         extent = MAX2(extent, by);
+         extent = MAX2(extent, cy);
+         /* (wMax/wMin - 1) * extent / 4 < 0.5 pixel */
+         affine = ((wMax - wMin) * extent < 2.0F * wMin);
+      }
+      if (affine) {
+         affine_mip_textured_triangle(ctx, v0, v1, v2);
+         return;
+      }
+   }
+
+   persp_textured_triangle_full(ctx, v0, v1, v2);
 }
 
 

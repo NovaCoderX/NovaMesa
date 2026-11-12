@@ -236,6 +236,23 @@ static INLINE int iround(float f)
 
 #define IROUND(x)  iround(x)
 
+#elif defined(__GNUC__) && defined(__mc68000__) && defined(__HAVE_68881__)
+
+/* NOVA: the 68k FPU rounds to nearest when moving to an integer register, so
+ * IROUND is a single fmove.l.  The portable macro below compiles to a test, a
+ * branch, an add and an fintrz as well -- and FloatToFixed() uses IROUND
+ * dozens of times in every triangle's setup.
+ * (Assumes the FPCR rounding mode is the default, round to nearest.)
+ */
+static INLINE int iround(float f)
+{
+   int r;
+   __asm__ ("fmove%.l %1,%0" : "=dm" (r) : "f" (f));
+   return r;
+}
+
+#define IROUND(x)  iround(x)
+
 #elif defined(USE_X86_ASM) && defined(__GNUC__) && defined(__i386__)
 
 

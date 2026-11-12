@@ -350,6 +350,178 @@ static void read_rgba_pixels(const GLcontext* gl_ctx, GLuint n, const GLint x[],
 	}
 }
 
+/**********************************************************************/
+/* NOVA: untextured triangles drawn straight into the back buffer      */
+/**********************************************************************/
+
+/*
+ * swrast's flat_rgba_triangle / smooth_rgba_triangle push every span through
+ * the general span pipeline: fill a mask, interpolate colour and Z into
+ * arrays, depth test the arrays, then call the driver to copy the survivors
+ * into the buffer.  For big spans that overhead is spread thin, but for small
+ * triangles (a span or two each) it is most of the cost.
+ *
+ * When the state is simple enough -- no texture, blending, fog, stencil,
+ * masking, stipple or scissor -- these do the depth test and the pixel write
+ * inline instead.  This is the same thing Mesa's own OSMesa and X11 drivers
+ * do.  amesa_choose_triangle() picks one of them when it can and otherwise
+ * defers to swrast.
+ */
+
+#define FIXED_TO_ARGB32(r, g, b, a) \
+	TC_ARGB32((GLuint) FixedToInt(r), (GLuint) FixedToInt(g), (GLuint) FixedToInt(b), (GLuint) FixedToInt(a))
+
+#define AMESA_TRI_COMMON \
+	AMesaContext* a_ctx = (AMesaContext*) ctx->DriverCtx;
+
+/* Smooth shaded, depth tested with ZTEST. */
+#define AMESA_SMOOTH_Z_SPAN(ZTEST) \
+	GLuint i; \
+	for (i = 0; i < span.end; i++) { \
+		const GLdepth z = FixedToDepth(span.z); \
+		if (z ZTEST zRow[i]) { \
+			pRow[i] = FIXED_TO_ARGB32(span.red, span.green, span.blue, span.alpha); \
+			zRow[i] = z; \
+		} \
+		span.red += span.redStep; \
+		span.green += span.greenStep; \
+		span.blue += span.blueStep; \
+		span.alpha += span.alphaStep; \
+		span.z += span.zStep; \
+	}
+
+static void smooth_z_less_triangle(GLcontext* ctx, const SWvertex* v0, const SWvertex* v1, const SWvertex* v2) {
+	AMESA_TRI_COMMON
+#define INTERP_Z 1
+#define DEPTH_TYPE DEFAULT_SOFTWARE_DEPTH_TYPE
+#define INTERP_RGB 1
+#define INTERP_ALPHA 1
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define RENDER_SPAN(span) AMESA_SMOOTH_Z_SPAN(<)
+#include "swrast/s_tritemp.h"
+}
+
+static void smooth_z_lequal_triangle(GLcontext* ctx, const SWvertex* v0, const SWvertex* v1, const SWvertex* v2) {
+	AMESA_TRI_COMMON
+#define INTERP_Z 1
+#define DEPTH_TYPE DEFAULT_SOFTWARE_DEPTH_TYPE
+#define INTERP_RGB 1
+#define INTERP_ALPHA 1
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define RENDER_SPAN(span) AMESA_SMOOTH_Z_SPAN(<=)
+#include "swrast/s_tritemp.h"
+}
+
+/* Flat shaded, depth tested. The colour comes from the provoking vertex. */
+#define AMESA_FLAT_Z_SPAN(ZTEST) \
+	GLuint i; \
+	for (i = 0; i < span.end; i++) { \
+		const GLdepth z = FixedToDepth(span.z); \
+		if (z ZTEST zRow[i]) { \
+			pRow[i] = pixel; \
+			zRow[i] = z; \
+		} \
+		span.z += span.zStep; \
+	}
+
+static void flat_z_less_triangle(GLcontext* ctx, const SWvertex* v0, const SWvertex* v1, const SWvertex* v2) {
+	AMESA_TRI_COMMON
+#define INTERP_Z 1
+#define DEPTH_TYPE DEFAULT_SOFTWARE_DEPTH_TYPE
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define SETUP_CODE \
+	const GLuint pixel = TC_ARGB32(v2->color[RCOMP], v2->color[GCOMP], v2->color[BCOMP], v2->color[ACOMP]);
+#define RENDER_SPAN(span) AMESA_FLAT_Z_SPAN(<)
+#include "swrast/s_tritemp.h"
+}
+
+static void flat_z_lequal_triangle(GLcontext* ctx, const SWvertex* v0, const SWvertex* v1, const SWvertex* v2) {
+	AMESA_TRI_COMMON
+#define INTERP_Z 1
+#define DEPTH_TYPE DEFAULT_SOFTWARE_DEPTH_TYPE
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define SETUP_CODE \
+	const GLuint pixel = TC_ARGB32(v2->color[RCOMP], v2->color[GCOMP], v2->color[BCOMP], v2->color[ACOMP]);
+#define RENDER_SPAN(span) AMESA_FLAT_Z_SPAN(<=)
+#include "swrast/s_tritemp.h"
+}
+
+/* No depth test at all (2D drawing). */
+static void smooth_triangle(GLcontext* ctx, const SWvertex* v0, const SWvertex* v1, const SWvertex* v2) {
+	AMESA_TRI_COMMON
+#define INTERP_RGB 1
+#define INTERP_ALPHA 1
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define RENDER_SPAN(span) \
+	GLuint i; \
+	for (i = 0; i < span.end; i++) { \
+		pRow[i] = FIXED_TO_ARGB32(span.red, span.green, span.blue, span.alpha); \
+		span.red += span.redStep; \
+		span.green += span.greenStep; \
+		span.blue += span.blueStep; \
+		span.alpha += span.alphaStep; \
+	}
+#include "swrast/s_tritemp.h"
+}
+
+static void flat_triangle(GLcontext* ctx, const SWvertex* v0, const SWvertex* v1, const SWvertex* v2) {
+	AMESA_TRI_COMMON
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define SETUP_CODE \
+	const GLuint pixel = TC_ARGB32(v2->color[RCOMP], v2->color[GCOMP], v2->color[BCOMP], v2->color[ACOMP]);
+#define RENDER_SPAN(span) \
+	GLuint i; \
+	for (i = 0; i < span.end; i++) { \
+		pRow[i] = pixel; \
+	}
+#include "swrast/s_tritemp.h"
+}
+
+/*
+ * Pick a triangle function. Anything not handled above is left to swrast.
+ */
+static void amesa_choose_triangle(GLcontext* ctx) {
+	SWcontext* swrast = SWRAST_CONTEXT(ctx);
+
+	if (ctx->RenderMode == GL_RENDER
+			&& !ctx->Polygon.SmoothFlag
+			&& !ctx->Polygon.StippleFlag
+			&& !(ctx->Polygon.CullFlag && ctx->Polygon.CullFaceMode == GL_FRONT_AND_BACK)
+			&& ctx->Texture._EnabledUnits == 0
+			&& ctx->Visual.depthBits == DEFAULT_SOFTWARE_DEPTH_BITS
+			&& ctx->Color._DrawDestMask == BACK_LEFT_BIT) {
+		const GLboolean smooth = (ctx->Light.ShadeModel == GL_SMOOTH);
+
+		if (swrast->_RasterMask == DEPTH_BIT && ctx->Depth.Mask == GL_TRUE && ctx->DrawBuffer->DepthBuffer) {
+			if (ctx->Depth.Func == GL_LESS) {
+				swrast->Triangle = smooth ? smooth_z_less_triangle : flat_z_less_triangle;
+				return;
+			}
+			if (ctx->Depth.Func == GL_LEQUAL) {
+				swrast->Triangle = smooth ? smooth_z_lequal_triangle : flat_z_lequal_triangle;
+				return;
+			}
+		} else if (swrast->_RasterMask == 0) {
+			swrast->Triangle = smooth ? smooth_triangle : flat_triangle;
+			return;
+		}
+	}
+
+	_swrast_choose_triangle(ctx);
+}
+
 // Setup pointers and other driver state that is constant for the life of a context.
 static void amesa_display_init_pointers(GLcontext* gl_ctx) {
 	struct swrast_device_driver* swdd = _swrast_GetDeviceDriverReference(gl_ctx);
@@ -397,6 +569,9 @@ static void amesa_display_init_pointers(GLcontext* gl_ctx) {
 	gl_ctx->Driver.CopyColorSubTable = _swrast_CopyColorSubTable;
 	gl_ctx->Driver.CopyConvolutionFilter1D = _swrast_CopyConvolutionFilter1D;
 	gl_ctx->Driver.CopyConvolutionFilter2D = _swrast_CopyConvolutionFilter2D;
+
+	// NOVA: let the driver offer its own direct-to-buffer triangle functions.
+	SWRAST_CONTEXT(gl_ctx)->choose_triangle = amesa_choose_triangle;
 
 	swdd->SetBuffer = set_buffer;
 
