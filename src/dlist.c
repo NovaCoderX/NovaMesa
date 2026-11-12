@@ -3158,7 +3158,11 @@ static void save_TexGenf( GLenum coord, GLenum pname, GLfloat param )
 
 static void save_TexGeni( GLenum coord, GLenum pname, GLint param )
 {
-   save_TexGeniv( coord, pname, &param );
+   /* NOVA: the vector form may read four elements */
+   GLint params[4];
+   params[0] = param;
+   params[1] = params[2] = params[3] = 0;
+   save_TexGeniv( coord, pname, params );
 }
 
 

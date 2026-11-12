@@ -2127,7 +2127,11 @@ _mesa_TexGenf( GLenum coord, GLenum pname, GLfloat param )
 void
 _mesa_TexGeni( GLenum coord, GLenum pname, GLint param )
 {
-   _mesa_TexGeniv( coord, pname, &param );
+   /* NOVA: the vector form may read four elements */
+   GLint params[4];
+   params[0] = param;
+   params[1] = params[2] = params[3] = 0;
+   _mesa_TexGeniv( coord, pname, params );
 }
 
 
