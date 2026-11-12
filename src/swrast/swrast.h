@@ -529,6 +529,29 @@ struct swrast_device_driver {
     */
 
 
+   /***
+    *** NOVA: optional.  Blend incoming fragments with the colour buffer and
+    *** write the result, in one go, using the context's current blend state.
+    ***
+    *** Without these, swrast reads the destination pixels into a temporary
+    *** array through ReadRGBASpan/Pixels, blends array against array, and
+    *** then writes the result back through WriteRGBASpan/Pixels: three passes
+    *** and two pixel-format conversions.  A driver that can address its
+    *** colour buffer directly can do all of that in a single loop.
+    ***
+    *** Return GL_FALSE to decline (unsupported blend mode, say); swrast then
+    *** falls back to the path above.  mask is never NULL.  Only called when
+    *** there is no logic op, colour masking or software alpha buffer.
+    ***/
+   GLboolean (*BlendRGBASpan)( const GLcontext *ctx,
+                               GLuint n, GLint x, GLint y,
+                               CONST GLchan rgba[][4], const GLubyte mask[] );
+
+   GLboolean (*BlendRGBAPixels)( const GLcontext *ctx,
+                                 GLuint n, const GLint x[], const GLint y[],
+                                 CONST GLchan rgba[][4], const GLubyte mask[] );
+
+
 
    /***
     *** For supporting hardware Z buffers:

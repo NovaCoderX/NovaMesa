@@ -886,6 +886,34 @@ _mesa_write_index_span( GLcontext *ctx, struct sw_span *span)
 }
 
 
+/*
+ * NOVA: let the driver blend and write the span itself, if it can.
+ * See BlendRGBASpan in swrast.h.  Returns GL_TRUE if the span is done.
+ */
+static INLINE GLboolean
+driver_blend_span( GLcontext *ctx, struct sw_span *span, GLuint colorMask )
+{
+   const SWcontext *swrast = SWRAST_CONTEXT(ctx);
+
+   if (colorMask != 0xffffffff || (swrast->_RasterMask & ALPHABUF_BIT))
+      return GL_FALSE;
+
+   if (span->arrayMask & SPAN_XY) {
+      return (GLboolean)
+         (swrast->Driver.BlendRGBAPixels
+          && (*swrast->Driver.BlendRGBAPixels)(ctx, span->end,
+                                               span->array->x, span->array->y,
+                                               (CONST GLchan (*)[4]) span->array->rgba,
+                                               span->array->mask));
+   }
+   return (GLboolean)
+      (swrast->Driver.BlendRGBASpan
+       && (*swrast->Driver.BlendRGBASpan)(ctx, span->end, span->x, span->y,
+                                          (CONST GLchan (*)[4]) span->array->rgba,
+                                          span->array->mask));
+}
+
+
 /**
  * This function may modify any of the array values in the span.
  * span->interpMask and span->arrayMask may be changed but will be restored
@@ -1029,6 +1057,12 @@ _mesa_write_rgba_span( GLcontext *ctx, struct sw_span *span)
          monoColor = GL_FALSE;
       }
       else if (ctx->Color.BlendEnabled) {
+         if (driver_blend_span(ctx, span, colorMask)) {
+            /* NOVA: blended and written by the driver */
+            span->interpMask = origInterpMask;
+            span->arrayMask = origArrayMask;
+            return;
+         }
          _mesa_blend_span(ctx, span, span->array->rgba);
          monoColor = GL_FALSE;
       }
@@ -1279,6 +1313,11 @@ _mesa_write_texture_span( GLcontext *ctx, struct sw_span *span)
          _mesa_logicop_rgba_span(ctx, span, span->array->rgba);
       }
       else if (ctx->Color.BlendEnabled) {
+         if (driver_blend_span(ctx, span, colorMask)) {
+            /* NOVA: blended and written by the driver */
+            span->arrayMask = origArrayMask;
+            return;
+         }
          _mesa_blend_span(ctx, span, span->array->rgba);
       }
 
