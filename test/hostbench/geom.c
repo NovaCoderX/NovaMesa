@@ -25,7 +25,7 @@ extern const char *_mesa_triFuncName;
 
 static int W = 640, H = 480;
 static AMesaContext *actx;
-static GLuint tex, gear1, gear2, gear3;
+static GLuint tex, tex2, gear1, gear2, gear3;
 
 static double now(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec + ts.tv_nsec*1e-9; }
 static unsigned rnd_state = 12345;
@@ -282,6 +282,29 @@ static void w_wire3d(float t)	/* depth-tested wireframe, colour varying along ea
 	}
 }
 
+/* Small opaque textured quads, one glBegin/glEnd each: a HUD or sprite layer.
+ * nbind = 0 binds one texture up front, 1 alternates between two textures so
+ * every quad forces a state validation. */
+static void quads_bind(float t, int alternate)
+{
+	int i;
+	set_2d(); glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D, tex);
+	glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+	rnd_state = 31337;
+	for (i = 0; i < 2000; i++) {
+		float x = frand() * (W - 12), y = frand() * (H - 12) + sinf(t + i), s = 8.0f;
+		if (alternate) glBindTexture(GL_TEXTURE_2D, (i & 1) ? tex2 : tex);
+		glBegin(GL_QUADS);
+		glTexCoord2f(0, 0); glVertex2f(x, y);
+		glTexCoord2f(1, 0); glVertex2f(x + s, y);
+		glTexCoord2f(1, 1); glVertex2f(x + s, y + s);
+		glTexCoord2f(0, 1); glVertex2f(x, y + s);
+		glEnd();
+	}
+}
+static void w_quads_onetex(float t) { quads_bind(t, 0); }
+static void w_quads_twotex(float t) { quads_bind(t, 1); }
+
 static struct { const char *name; void (*fn)(float); } work[] = {
 	{ "gears (display lists, lit)",              w_gears },
 	{ "spheres: textured, colour per vertex",    w_spheres_tex },
@@ -291,6 +314,8 @@ static struct { const char *name; void (*fn)(float); } work[] = {
 	{ "2D blended textured quads x3000",         w_quads2d },
 	{ "2D plain lines x4000 + points x3000",     w_plain2d },
 	{ "3D wireframe, depth tested",              w_wire3d },
+	{ "2D textured quads x2000, one texture",    w_quads_onetex },
+	{ "2D textured quads x2000, bind per quad",  w_quads_twotex },
 };
 #define NWORK (int)(sizeof(work)/sizeof(work[0]))
 
@@ -316,6 +341,11 @@ int main(int argc, char **argv)
 	for (y = 0; y < 64; y++) for (x = 0; x < 64; x++) { unsigned char *p = img + (y*64+x)*4; int c = ((x>>3) ^ (y>>3)) & 1;
 		p[0] = c ? 230 : 110; p[1] = 140 + ((x*y)&63); p[2] = c ? 90 : 200; p[3] = 255; }
 	glGenTextures(1, &tex); glBindTexture(GL_TEXTURE_2D, tex);
+	for (lvl = 0, sz = 64; sz >= 1; lvl++, sz >>= 1) glTexImage2D(GL_TEXTURE_2D, lvl, 3, sz, sz, 0, GL_RGBA, GL_UNSIGNED_BYTE, img);
+	glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+	for (y = 0; y < 64*64; y++) { img[y*4] ^= 0x55; img[y*4+2] ^= 0xaa; }
+	glGenTextures(1, &tex2); glBindTexture(GL_TEXTURE_2D, tex2);
 	for (lvl = 0, sz = 64; sz >= 1; lvl++, sz >>= 1) glTexImage2D(GL_TEXTURE_2D, lvl, 3, sz, sz, 0, GL_RGBA, GL_UNSIGNED_BYTE, img);
 	glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 	glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);

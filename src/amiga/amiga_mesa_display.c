@@ -352,6 +352,170 @@ static void read_rgba_pixels(const GLcontext* gl_ctx, GLuint n, const GLint x[],
 }
 
 /**********************************************************************/
+/* NOVA: blending straight into the back buffer                        */
+/**********************************************************************/
+
+/*
+ * swrast blends by reading the destination span into a GLchan array (through
+ * read_rgba_span above), combining it with the source array, and then writing
+ * the result back (through write_rgba_span): three loops over the pixels and
+ * a pixel-format conversion each way.  These do the same arithmetic in one
+ * loop against the ARGB32 words in the buffer.
+ *
+ * Only the blend modes swrast itself special-cases are handled; anything else
+ * returns GL_FALSE and swrast carries on as before.  The per-channel formulas
+ * are copied from swrast/s_blend.c so the results are bit-for-bit the same.
+ */
+enum {
+	AMESA_BLEND_NONE = 0,
+	AMESA_BLEND_TRANSPARENCY,	/* SRC_ALPHA, ONE_MINUS_SRC_ALPHA */
+	AMESA_BLEND_ADD,		/* ONE, ONE */
+	AMESA_BLEND_MODULATE,		/* ZERO, SRC_COLOR  or  DST_COLOR, ZERO */
+	AMESA_BLEND_MODULATE2X		/* DST_COLOR, SRC_COLOR */
+};
+
+/* Mirrors the tests in _swrast_choose_blend_func(). */
+static GLint amesa_blend_mode(const GLcontext* ctx) {
+	const GLenum srcRGB = ctx->Color.BlendSrcRGB;
+	const GLenum dstRGB = ctx->Color.BlendDstRGB;
+
+	if (ctx->Color.BlendEquation != GL_FUNC_ADD_EXT || srcRGB != ctx->Color.BlendSrcA || dstRGB != ctx->Color.BlendDstA) {
+		return AMESA_BLEND_NONE;
+	}
+	if (srcRGB == GL_SRC_ALPHA && dstRGB == GL_ONE_MINUS_SRC_ALPHA) {
+		return AMESA_BLEND_TRANSPARENCY;
+	}
+	if (srcRGB == GL_ONE && dstRGB == GL_ONE) {
+		return AMESA_BLEND_ADD;
+	}
+	if ((srcRGB == GL_ZERO && dstRGB == GL_SRC_COLOR) || (srcRGB == GL_DST_COLOR && dstRGB == GL_ZERO)) {
+		return AMESA_BLEND_MODULATE;
+	}
+	if (srcRGB == GL_DST_COLOR && dstRGB == GL_SRC_COLOR) {
+		return AMESA_BLEND_MODULATE2X;
+	}
+	return AMESA_BLEND_NONE;
+}
+
+/* (X) / 255 the way blend_transparency() does it; X may be negative. */
+#define AMESA_DIV255(X)	(((X) * 257 + 256) >> 16)
+
+#define AMESA_DST_A(d)	((GLint) ((d) >> 24))
+#define AMESA_DST_R(d)	((GLint) (((d) >> 16) & 0xff))
+#define AMESA_DST_G(d)	((GLint) (((d) >> 8) & 0xff))
+#define AMESA_DST_B(d)	((GLint) ((d) & 0xff))
+
+static INLINE GLuint amesa_blend_transparency(const GLubyte* src, GLuint d) {
+	const GLint t = src[ACOMP];
+
+	if (t == 0) {
+		return d;
+	}
+	if (t == 255) {
+		return TC_ARGB32((GLuint) src[RCOMP], (GLuint) src[GCOMP], (GLuint) src[BCOMP], 255u);
+	}
+	{
+		const GLint dr = AMESA_DST_R(d), dg = AMESA_DST_G(d), db = AMESA_DST_B(d), da = AMESA_DST_A(d);
+		const GLint r = AMESA_DIV255((src[RCOMP] - dr) * t) + dr;
+		const GLint g = AMESA_DIV255((src[GCOMP] - dg) * t) + dg;
+		const GLint b = AMESA_DIV255((src[BCOMP] - db) * t) + db;
+		const GLint a = AMESA_DIV255((t - da) * t) + da;
+		return TC_ARGB32((GLuint) (GLubyte) r, (GLuint) (GLubyte) g, (GLuint) (GLubyte) b, (GLuint) (GLubyte) a);
+	}
+}
+
+static INLINE GLuint amesa_blend_add(const GLubyte* src, GLuint d) {
+	GLint r = src[RCOMP] + AMESA_DST_R(d);
+	GLint g = src[GCOMP] + AMESA_DST_G(d);
+	GLint b = src[BCOMP] + AMESA_DST_B(d);
+	GLint a = src[ACOMP] + AMESA_DST_A(d);
+	if (r > 255) r = 255;
+	if (g > 255) g = 255;
+	if (b > 255) b = 255;
+	if (a > 255) a = 255;
+	return TC_ARGB32((GLuint) r, (GLuint) g, (GLuint) b, (GLuint) a);
+}
+
+static INLINE GLuint amesa_blend_modulate(const GLubyte* src, GLuint d) {
+	const GLint r = (src[RCOMP] * AMESA_DST_R(d) + 255) >> 8;
+	const GLint g = (src[GCOMP] * AMESA_DST_G(d) + 255) >> 8;
+	const GLint b = (src[BCOMP] * AMESA_DST_B(d) + 255) >> 8;
+	const GLint a = (src[ACOMP] * AMESA_DST_A(d) + 255) >> 8;
+	return TC_ARGB32((GLuint) r, (GLuint) g, (GLuint) b, (GLuint) a);
+}
+
+static INLINE GLuint amesa_blend_modulate2x(const GLubyte* src, GLuint d) {
+	GLint r = (src[RCOMP] * AMESA_DST_R(d) * 2 + 255) >> 8;
+	GLint g = (src[GCOMP] * AMESA_DST_G(d) * 2 + 255) >> 8;
+	GLint b = (src[BCOMP] * AMESA_DST_B(d) * 2 + 255) >> 8;
+	GLint a = (src[ACOMP] * AMESA_DST_A(d) * 2 + 255) >> 8;
+	if (r > 255) r = 255;
+	if (g > 255) g = 255;
+	if (b > 255) b = 255;
+	if (a > 255) a = 255;
+	return TC_ARGB32((GLuint) r, (GLuint) g, (GLuint) b, (GLuint) a);
+}
+
+#define AMESA_BLEND_SPAN_LOOP(FUNC) \
+	for (GLuint i = 0; i < n; i++) { \
+		if (mask[i]) { \
+			buffer[i] = FUNC(rgba[i], buffer[i]); \
+		} \
+	}
+
+#define AMESA_BLEND_PIXELS_LOOP(FUNC) \
+	for (GLuint i = 0; i < n; i++) { \
+		if (mask[i]) { \
+			GLuint* p = a_ctx->row[y[i]] + x[i]; \
+			*p = FUNC(rgba[i], *p); \
+		} \
+	}
+
+static GLboolean blend_rgba_span(const GLcontext* gl_ctx, GLuint n, GLint x, GLint y, const GLubyte rgba[][4], const GLubyte mask[]) {
+	AMesaContext* a_ctx = (AMesaContext*) gl_ctx->DriverCtx;
+	GLuint* buffer = a_ctx->row[y] + x;
+
+	switch (amesa_blend_mode(gl_ctx)) {
+		case AMESA_BLEND_TRANSPARENCY:
+			AMESA_BLEND_SPAN_LOOP(amesa_blend_transparency)
+			return GL_TRUE;
+		case AMESA_BLEND_ADD:
+			AMESA_BLEND_SPAN_LOOP(amesa_blend_add)
+			return GL_TRUE;
+		case AMESA_BLEND_MODULATE:
+			AMESA_BLEND_SPAN_LOOP(amesa_blend_modulate)
+			return GL_TRUE;
+		case AMESA_BLEND_MODULATE2X:
+			AMESA_BLEND_SPAN_LOOP(amesa_blend_modulate2x)
+			return GL_TRUE;
+		default:
+			return GL_FALSE;
+	}
+}
+
+static GLboolean blend_rgba_pixels(const GLcontext* gl_ctx, GLuint n, const GLint x[], const GLint y[], const GLubyte rgba[][4],
+		const GLubyte mask[]) {
+	AMesaContext* a_ctx = (AMesaContext*) gl_ctx->DriverCtx;
+
+	switch (amesa_blend_mode(gl_ctx)) {
+		case AMESA_BLEND_TRANSPARENCY:
+			AMESA_BLEND_PIXELS_LOOP(amesa_blend_transparency)
+			return GL_TRUE;
+		case AMESA_BLEND_ADD:
+			AMESA_BLEND_PIXELS_LOOP(amesa_blend_add)
+			return GL_TRUE;
+		case AMESA_BLEND_MODULATE:
+			AMESA_BLEND_PIXELS_LOOP(amesa_blend_modulate)
+			return GL_TRUE;
+		case AMESA_BLEND_MODULATE2X:
+			AMESA_BLEND_PIXELS_LOOP(amesa_blend_modulate2x)
+			return GL_TRUE;
+		default:
+			return GL_FALSE;
+	}
+}
+
+/**********************************************************************/
 /* NOVA: untextured triangles drawn straight into the back buffer      */
 /**********************************************************************/
 
@@ -509,9 +673,13 @@ static void flat_triangle(GLcontext* ctx, const SWvertex* v0, const SWvertex* v1
  * pixel-exact those few lines are handed back to swrast's own function.
  */
 #define AMESA_LINE_COMMON \
-	AMesaContext* a_ctx = (AMesaContext*) ctx->DriverCtx; \
-	if ((GLuint) (GLint) vert0->win[0] >= a_ctx->width || (GLuint) (GLint) vert1->win[0] >= a_ctx->width \
-			|| (GLuint) (GLint) vert0->win[1] >= a_ctx->height || (GLuint) (GLint) vert1->win[1] >= a_ctx->height) { \
+	AMesaContext* a_ctx = (AMesaContext*) ctx->DriverCtx;
+
+// Runs as s_linetemp.h's SETUP_CODE, i.e. once the template has the integer
+// end points x0,y0,x1,y1 and before it touches the buffer.
+#define AMESA_LINE_EDGE_CHECK \
+	if ((GLuint) x0 >= a_ctx->width || (GLuint) x1 >= a_ctx->width \
+			|| (GLuint) y0 >= a_ctx->height || (GLuint) y1 >= a_ctx->height) { \
 		((swrast_line_func) a_ctx->swrast_line)(ctx, vert0, vert1); \
 		return; \
 	}
@@ -527,6 +695,7 @@ static void flat_line(GLcontext* ctx, const SWvertex* vert0, const SWvertex* ver
 #define BYTES_PER_ROW (a_ctx->pitch)
 #define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
 #define PLOT(X, Y) *pixelPtr = pixel;
+#define SETUP_CODE AMESA_LINE_EDGE_CHECK
 #include "swrast/s_linetemp.h"
 }
 
@@ -543,6 +712,7 @@ static void smooth_line(GLcontext* ctx, const SWvertex* vert0, const SWvertex* v
 #define BYTES_PER_ROW (a_ctx->pitch)
 #define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
 #define PLOT(X, Y) *pixelPtr = FIXED_TO_ARGB32(r0, g0, b0, a0);
+#define SETUP_CODE AMESA_LINE_EDGE_CHECK
 #include "swrast/s_linetemp.h"
 }
 
@@ -555,6 +725,7 @@ static void flat_z_less_line(GLcontext* ctx, const SWvertex* vert0, const SWvert
 #define BYTES_PER_ROW (a_ctx->pitch)
 #define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
 #define PLOT(X, Y) if (Z < *zPtr) { *zPtr = Z; *pixelPtr = pixel; }
+#define SETUP_CODE AMESA_LINE_EDGE_CHECK
 #include "swrast/s_linetemp.h"
 }
 
@@ -567,6 +738,7 @@ static void flat_z_lequal_line(GLcontext* ctx, const SWvertex* vert0, const SWve
 #define BYTES_PER_ROW (a_ctx->pitch)
 #define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
 #define PLOT(X, Y) if (Z <= *zPtr) { *zPtr = Z; *pixelPtr = pixel; }
+#define SETUP_CODE AMESA_LINE_EDGE_CHECK
 #include "swrast/s_linetemp.h"
 }
 
@@ -584,6 +756,7 @@ static void smooth_z_less_line(GLcontext* ctx, const SWvertex* vert0, const SWve
 #define BYTES_PER_ROW (a_ctx->pitch)
 #define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
 #define PLOT(X, Y) if (Z < *zPtr) { *zPtr = Z; *pixelPtr = FIXED_TO_ARGB32(r0, g0, b0, a0); }
+#define SETUP_CODE AMESA_LINE_EDGE_CHECK
 #include "swrast/s_linetemp.h"
 }
 
@@ -601,6 +774,7 @@ static void smooth_z_lequal_line(GLcontext* ctx, const SWvertex* vert0, const SW
 #define BYTES_PER_ROW (a_ctx->pitch)
 #define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
 #define PLOT(X, Y) if (Z <= *zPtr) { *zPtr = Z; *pixelPtr = FIXED_TO_ARGB32(r0, g0, b0, a0); }
+#define SETUP_CODE AMESA_LINE_EDGE_CHECK
 #include "swrast/s_linetemp.h"
 }
 
@@ -822,6 +996,10 @@ static void amesa_display_init_pointers(GLcontext* gl_ctx) {
 
 	swdd->ReadRGBASpan = read_rgba_span;
 	swdd->ReadRGBAPixels = read_rgba_pixels;
+
+	// NOVA: one-pass blending, see blend_rgba_span().
+	swdd->BlendRGBASpan = blend_rgba_span;
+	swdd->BlendRGBAPixels = blend_rgba_pixels;
 
 	// Initialize the TNL driver interface...
 	tnl_ctx->Driver.RunPipeline = _tnl_run_pipeline;

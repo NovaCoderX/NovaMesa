@@ -15,9 +15,13 @@ the repo) using:
 - **Performance work must be general.** Fast paths are chosen from OpenGL state
   only, never from knowledge of a particular application. Anything a fast path
   does not fully handle must fall through to the original Mesa code.
-- **Prefer fixed point in inner loops.** The 68060 FPU is slow relative to its
-  integer unit and float<->int conversions are expensive. Float work per
-  triangle or per 16-pixel run is fine; float work per pixel is not.
+- **Prefer fixed point in inner loops.** Float divides and float<->int
+  conversions are expensive on every target, and under a software-emulated
+  FPU (qemu, FS-UAE without a JIT FPU) all float work is. Float work per
+  triangle or per 16-pixel run is fine; float work per pixel is not. But do
+  not convert per-vertex or per-triangle float maths to fixed point just for
+  its own sake: on a real 68060 and on Emu68 a float add or multiply costs
+  about the same as an integer one.
 - **C first, assembler only on evidence.** On Emu68 the 68k code is translated
   to ARM, and the 68k FPU has no SIMD, so hand-written 68k assembly rarely
   beats gcc -O2. Only consider it for one specific loop that a profile shows is
@@ -240,30 +244,65 @@ the "Collected" instruction count for regressions, subtracting an init-only
 run (`ONLY=99`), and take the best of several qemu runs for float-heavy
 direction.
 
+## Fourth round: four candidates evaluated
+
+The owner picked four of the remaining ideas to try and keep only if they
+proved worth it. One was implemented; three were measured and declined. The
+measurements are recorded so they are not repeated.
+
+**Blended primitives -- implemented.** swrast blended by reading the
+destination span into a temporary through the driver, blending array against
+array, and writing back: three passes and two pixel-format conversions. There
+are now two optional hooks in `struct swrast_device_driver` (`swrast.h`),
+`BlendRGBASpan` and `BlendRGBAPixels`, called from `driver_blend_span()` in
+`s_span.c` for both the plain and the textured span writers. The driver
+(`blend_rgba_span` / `blend_rgba_pixels` in `amiga_mesa_display.c`) blends
+against the ARGB32 words in one loop for the modes swrast special-cases:
+transparency, add, modulate and 2x modulate. Any other mode returns GL_FALSE
+and swrast does it the old way. The formulas are copied from `s_blend.c`, so
+the output is byte-identical. Native instruction counts: additive lines -21%,
+blended textured quads -17%, two-pass lightmapped corridor -9%. About -5% and
+-11% wall-clock for the first two under qemu.
+
+Also: the driver lines' edge check moved into `s_linetemp.h`'s `SETUP_CODE`,
+where the integer end points already exist, saving four float->int
+conversions per line.
+
+**Vertex pipeline fast path -- declined.** For the 2D lines-and-points
+workload the whole vertex side (immediate API, fixup, transform, clip test,
+building `SWvertex`) is about 30% of native instructions, roughly 180 per
+vertex, spread across six stages at 10-30 each with no hot spot. Under qemu's
+software FPU it is about half the frame. A fast path would mean a second
+vertex pipeline for simple state and at best halve that 30%.
+
+**Triangle setup in fixed point / early cull -- declined.** An experiment
+culling on the unsnapped float area before the fixed-point conversions saved
+1.5-4.5% of instructions on the sphere workloads but changed a few silhouette
+pixels (the area sign of sub-pixel slivers can differ after snapping); making
+it exact needs a conservative margin that costs most of the gain. Fixed-point
+colour gradients need 64-bit products to be safe on sliver triangles (which
+`-m68060` turns into library calls), lose bit-exactness, and target at most
+about 5% on smooth-shaded small triangles.
+
+**State validation on glBindTexture -- declined.** Measured with the two new
+`geom` workloads ("2D textured quads, one texture" vs "bind per quad"): about
+2,400 native instructions per bind-plus-revalidation, including flushing the
+immediate buffer, with no single expensive step. A few hundred binds a frame
+is well under 1% of a frame.
+
 ## Ideas not done yet
 
-In rough order of expected value:
-
-- **Per-vertex float work in the vertex pipeline.** After round three this is
-  what is left for line/point-heavy 2D drawing under a slow FPU: modelview and
-  projection transform, clip test, viewport map, and the copy into `SWvertex`.
-  An identity or pure 2D-ortho fast path through transform and clip test is
-  the obvious candidate. Profile before starting; under a fast FPU it is only
-  a few percent.
-- **Triangle setup float work**: compute attribute gradients in fixed point;
-  cull before converting all three vertices.
-- **Blended primitives.** Additive/alpha-blended lines and spans still read
-  the framebuffer into a temporary, blend, and write back. Direct blended
-  variants of the driver functions would cover that.
+- **Direct blended lines/points/triangles in the driver.** Blended untextured
+  primitives now blend in one pass but still go through swrast's generic
+  functions and span pipeline first. Only worth it for an application that
+  draws a lot of blended lines; none of the known ones do.
 - **Wide lines** (`glLineWidth` > 1) go through the general path.
-- **State validation**: every `glBindTexture` sets `_NEW_TEXTURE` and forces
-  the triangle and sampler functions to be re-chosen.
 - **Widen the dualtex path**: `GL_MODULATE` on unit 0, `GL_DECAL`/`GL_ADD` on
   unit 1.
 - **Clear and swap.** `glClear` copies a pre-filled buffer the size of the
-  screen and the swap copies it again; a fill loop and rendering in the
-  screen's native format would cut memory traffic. Needs measuring on real
-  hardware, not here.
+  screen (8% of the 2D lines workload) and the swap copies it again; a fill
+  loop and rendering in the screen's native format would cut memory traffic.
+  Needs measuring on real hardware, not here.
 
 Other ideas noted but deliberately left alone:
 
