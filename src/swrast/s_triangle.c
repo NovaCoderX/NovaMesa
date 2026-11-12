@@ -349,6 +349,49 @@ span_hidden( const GLcontext *ctx, const struct sw_span *span )
 }
 
 
+/*
+ * NOVA: is perspective correction worth doing for this triangle?
+ *
+ * It only matters when 1/w differs noticeably between the vertices.  For
+ * 2D/orthographic drawing it is constant, and for small or distant triangles
+ * it barely changes; in both cases plain linear interpolation lands within a
+ * fraction of a pixel of the correct result.  This bounds the screen-space
+ * error (roughly a quarter of the relative change in w times the triangle's
+ * size) to about half a pixel.
+ */
+static INLINE GLboolean
+triangle_is_near_affine( const SWvertex *v0, const SWvertex *v1,
+                         const SWvertex *v2 )
+{
+   const GLfloat w0 = v0->win[3], w1 = v1->win[3], w2 = v2->win[3];
+   GLfloat wMin = w0, wMax = w0;
+
+   if (w1 < wMin) wMin = w1; else if (w1 > wMax) wMax = w1;
+   if (w2 < wMin) wMin = w2; else if (w2 > wMax) wMax = w2;
+
+   if (wMin <= 0.0F)
+      return GL_FALSE;
+   if (wMin == wMax)
+      return GL_TRUE;
+   {
+      /* largest extent of the triangle on screen, in pixels */
+      const GLfloat ax = FABSF(v1->win[0] - v0->win[0]);
+      const GLfloat bx = FABSF(v2->win[0] - v0->win[0]);
+      const GLfloat cx = FABSF(v2->win[0] - v1->win[0]);
+      const GLfloat ay = FABSF(v1->win[1] - v0->win[1]);
+      const GLfloat by = FABSF(v2->win[1] - v0->win[1]);
+      const GLfloat cy = FABSF(v2->win[1] - v1->win[1]);
+      GLfloat extent = MAX2(ax, bx);
+      extent = MAX2(extent, cx);
+      extent = MAX2(extent, ay);
+      extent = MAX2(extent, by);
+      extent = MAX2(extent, cy);
+      /* (wMax/wMin - 1) * extent / 4 < 0.5 pixel */
+      return (GLboolean) ((wMax - wMin) * extent < 2.0F * wMin);
+   }
+}
+
+
 struct affine_info
 {
    GLenum filter;
@@ -1045,56 +1088,24 @@ static void affine_mip_textured_triangle( GLcontext *ctx,
 
 
 /*
- * NOVA: perspective-correct textured triangle, front end.
- *
- * Perspective correction only matters when 1/w differs noticeably between
- * the vertices.  For 2D/orthographic drawing it is constant, and for small
- * or distant triangles it barely changes; in both cases plain affine
- * interpolation lands within a fraction of a pixel of the correct result and
- * needs no per-span floating point.  The test below bounds the screen-space
- * error (roughly a quarter of the relative change in w times the triangle's
- * size) to about half a pixel; anything larger takes the real perspective
- * path.
+ * NOVA: perspective-correct textured triangle, front end.  Triangles that do
+ * not need perspective correction (see triangle_is_near_affine) take the
+ * affine path, whose spans use no floating point at all.
  */
 static void persp_textured_triangle( GLcontext *ctx,
 				     const SWvertex *v0,
 				     const SWvertex *v1,
 				     const SWvertex *v2 )
 {
-   const GLfloat w0 = v0->win[3], w1 = v1->win[3], w2 = v2->win[3];
-   GLfloat wMin = w0, wMax = w0;
-
-   if (w1 < wMin) wMin = w1; else if (w1 > wMax) wMax = w1;
-   if (w2 < wMin) wMin = w2; else if (w2 > wMax) wMax = w2;
-
-   if (wMin > 0.0F
-       && v0->texcoord[0][3] == 1.0F
+   if (v0->texcoord[0][3] == 1.0F
        && v1->texcoord[0][3] == 1.0F
-       && v2->texcoord[0][3] == 1.0F) {
-      GLboolean affine = (wMin == wMax);
-      if (!affine) {
-         /* largest extent of the triangle on screen, in pixels */
-         const GLfloat ax = FABSF(v1->win[0] - v0->win[0]);
-         const GLfloat bx = FABSF(v2->win[0] - v0->win[0]);
-         const GLfloat cx = FABSF(v2->win[0] - v1->win[0]);
-         const GLfloat ay = FABSF(v1->win[1] - v0->win[1]);
-         const GLfloat by = FABSF(v2->win[1] - v0->win[1]);
-         const GLfloat cy = FABSF(v2->win[1] - v1->win[1]);
-         GLfloat extent = MAX2(ax, bx);
-         extent = MAX2(extent, cx);
-         extent = MAX2(extent, ay);
-         extent = MAX2(extent, by);
-         extent = MAX2(extent, cy);
-         /* (wMax/wMin - 1) * extent / 4 < 0.5 pixel */
-         affine = ((wMax - wMin) * extent < 2.0F * wMin);
-      }
-      if (affine) {
-         affine_mip_textured_triangle(ctx, v0, v1, v2);
-         return;
-      }
+       && v2->texcoord[0][3] == 1.0F
+       && triangle_is_near_affine(v0, v1, v2)) {
+      affine_mip_textured_triangle(ctx, v0, v1, v2);
    }
-
-   persp_textured_triangle_full(ctx, v0, v1, v2);
+   else {
+      persp_textured_triangle_full(ctx, v0, v1, v2);
+   }
 }
 
 

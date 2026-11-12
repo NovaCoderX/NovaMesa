@@ -242,6 +242,46 @@ static void w_quads2d(float t)	/* small alpha-blended sprites */
 	glEnd();
 }
 
+static void w_plain2d(float t)	/* unblended lines and points, default state: an arcade vector game */
+{
+	int i;
+	set_2d();
+	rnd_state = 999;
+	glBegin(GL_POINTS);
+	for (i = 0; i < 3000; i++) {
+		GLfloat c[3]; c[0] = frand(); c[1] = frand(); c[2] = frand();
+		glColor3fv(c); glVertex2i((int)(frand() * W), (int)(frand() * H));
+	}
+	glEnd();
+	glBegin(GL_LINES);
+	for (i = 0; i < 4000; i++) {
+		GLfloat c[3]; float x = frand() * W, y = frand() * H, a = frand() * 6.28f + t, l = 6.0f + frand() * 30.0f;
+		c[0] = frand(); c[1] = frand(); c[2] = frand();
+		glColor3fv(c);
+		glVertex2i((int) x, (int) y); glVertex2i((int)(x + cosf(a) * l), (int)(y + sinf(a) * l));
+	}
+	glEnd();
+}
+static void w_wire3d(float t)	/* depth-tested wireframe, colour varying along each line */
+{
+	int n, i, j;
+	set_3d();
+	for (n = 0; n < 24; n++) {
+		glPushMatrix();
+		glTranslatef(((n % 6) - 2.5f) * 2.6f, ((n / 6) - 1.5f) * 2.6f, -14.0f + (n & 3));
+		glRotatef(t * 40.0f + n * 15.0f, 0.3f, 1.0f, 0.1f);
+		for (j = 1; j < STACKS; j++) {
+			glBegin(GL_LINE_STRIP);
+			for (i = 0; i <= SLICES; i++) { const float *v = sph[j][i]; glColor3f(v[0]*0.5f+0.5f, v[1]*0.5f+0.5f, v[2]*0.5f+0.5f); glVertex3fv(v); }
+			glEnd();
+		}
+		glBegin(GL_POINTS);
+		for (j = 0; j <= STACKS; j++) for (i = 0; i < SLICES; i += 2) { glColor3f(1, 1, 1); glVertex3f(sph[j][i][0]*1.1f, sph[j][i][1]*1.1f, sph[j][i][2]*1.1f); }
+		glEnd();
+		glPopMatrix();
+	}
+}
+
 static struct { const char *name; void (*fn)(float); } work[] = {
 	{ "gears (display lists, lit)",              w_gears },
 	{ "spheres: textured, colour per vertex",    w_spheres_tex },
@@ -249,6 +289,8 @@ static struct { const char *name; void (*fn)(float); } work[] = {
 	{ "spheres: flat colour, untextured",        w_spheres_flat },
 	{ "2D additive lines x4000",                 w_lines },
 	{ "2D blended textured quads x3000",         w_quads2d },
+	{ "2D plain lines x4000 + points x3000",     w_plain2d },
+	{ "3D wireframe, depth tested",              w_wire3d },
 };
 #define NWORK (int)(sizeof(work)/sizeof(work[0]))
 
