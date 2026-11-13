@@ -9,27 +9,28 @@
 #include <proto/intuition.h>
 #include <proto/graphics.h>
 #include <proto/utility.h>
-
-
-#include <proto/cybergraphics.h>
-#include <cybergraphics/cybergraphics.h>
-
+#include <clib/icon_protos.h>
+#include <workbench/startup.h>
+#include <proto/Picasso96.h>
+#include <libraries/Picasso96.h>
 
 #include <GL/amiga_mesa.h>
 #include <GL/glu.h>
 
 #define WIDTH 640
 #define HEIGHT 480
-#define DEPTH 32
 
+
+// the startup message from workbench or 0 if started via cli
+extern struct WBStartup *_WBenchMsg;
 
 // Hardware screen - Only used when running in fullscreen.
-static struct Screen *_hardwareScreen = NULL;
+static struct Screen *_customScreen = NULL;
 
 // Hardware window - Used for both fullscreen and window modes.
 static struct Window *_hardwareWindow = NULL;
 
-struct Library *CyberGfxBase = NULL;
+struct Library *Picasso96Base = NULL;
 
 
 static AMesaContext *context = NULL;
@@ -40,48 +41,6 @@ static UWORD _blankCursor[] = { 0x0000, 0x0000,   // reserved, must be NULL
 		};
 
 
-static ULONG getCyberModeId(int width, int height, int depth) {
-    ULONG modeId = INVALID_ID;
-    ULONG nextid = NextDisplayInfo(INVALID_ID);
-    ULONG pixelFormat = 0;
-
-	while ((nextid != INVALID_ID)) {
-		if (IsCyberModeID(nextid)) {
-			GLboolean validMode = GL_FALSE;
-
-			pixelFormat = GetCyberIDAttr(CYBRIDATTR_PIXFMT, nextid);
-			if (depth == 8) {
-				if (pixelFormat == PIXFMT_LUT8) {
-					validMode = GL_TRUE;
-				}
-			} else {
-                if (depth == 32) {
-    				if ((pixelFormat == PIXFMT_ARGB32) || (pixelFormat == PIXFMT_BGRA32) || (pixelFormat == PIXFMT_RGBA32)) {
-    					validMode = GL_TRUE;
-    				}
-                } else {
-    				if ((pixelFormat == PIXFMT_BGR24) || (pixelFormat == PIXFMT_RGB24)) {
-    					validMode = GL_TRUE;
-    				}
-                }
-			}
-
-			if (validMode) {
-                if (GetCyberIDAttr(CYBRIDATTR_WIDTH, nextid) == width) {
-                	if (GetCyberIDAttr(CYBRIDATTR_HEIGHT, nextid) == height) {
-                        // Success, exact match.
-                        modeId = nextid;
-                        break;
-                    }
-                }
-            }
-		}
-
-		nextid = NextDisplayInfo(nextid);
-	}
-
-    return modeId;
-}
 
 
 
@@ -299,16 +258,73 @@ void exitT(void) {
 		_hardwareWindow = NULL;
 	}
 
-	if (_hardwareScreen) {
+	if (_customScreen) {
 		// We opened the screen and therefore must close it (running in full screen mode).
-		CloseScreen(_hardwareScreen);
-		_hardwareScreen = NULL;
+		CloseScreen(_customScreen);
+		_customScreen = NULL;
 	}
 
-	if (CyberGfxBase) {
-		CloseLibrary(CyberGfxBase);
-		CyberGfxBase = NULL;
+	if (Picasso96Base) {
+		CloseLibrary(Picasso96Base);
+		Picasso96Base = NULL;
 	}
+}
+
+static int isP96Mode(ULONG modeId) {
+	if (modeId == INVALID_ID) {
+		return 0;
+	}
+
+	return p96GetModeIDAttr(modeId, P96IDA_ISP96) ? 1 : 0;
+}
+
+static int isUsableP96Mode(ULONG modeId) {
+	if (!isP96Mode(modeId)) {
+		return 1;
+	}
+
+	if (ModeNotAvailable(modeId)) {
+		return 0;
+	}
+
+	return 1;
+}
+
+static int isPixelFormat32(ULONG pixelFormat) {
+	switch (pixelFormat)
+	{
+		case RGBFB_A8R8G8B8:
+		case RGBFB_A8B8G8R8:
+		case RGBFB_R8G8B8A8:
+		case RGBFB_B8G8R8A8:
+			return 1;
+
+		default:
+			return 0;
+	}
+}
+
+static ULONG getP96Mode32(int width, int height) {
+	ULONG modeId = INVALID_ID;
+	ULONG nextid = NextDisplayInfo(INVALID_ID);
+
+	while (nextid != INVALID_ID) {
+		if (isUsableP96Mode(nextid)) {
+			if (isPixelFormat32(p96GetModeIDAttr(nextid, P96IDA_RGBFORMAT))) {
+				if (p96GetModeIDAttr(nextid, P96IDA_WIDTH) == (ULONG)width) {
+					if (p96GetModeIDAttr(nextid, P96IDA_HEIGHT) == (ULONG)height) {
+						// Success, exact match.
+						modeId = nextid;
+						break;
+					}
+				}
+			}
+		}
+
+		nextid = NextDisplayInfo(nextid);
+	}
+
+	return modeId;
 }
 
 static struct Screen* CreateHardwareScreen(ULONG modeId, int width, int height, int bpp) {
@@ -322,34 +338,83 @@ static struct Window* CreateHardwareWindowFullScreen(int width, int height, stru
 			TRUE, WA_IDCMP, IDCMP_CLOSEWINDOW|IDCMP_ACTIVEWINDOW|IDCMP_INACTIVEWINDOW, TAG_END);
 }
 
+static struct Window* CreateHardwareWindow(int width, int height, struct Screen *screen) {
+
+	LONG left = 0;
+	LONG top = 0;
+
+	left = (screen->Width - width) / 2;
+	top = (screen->Height - height) / 2;
+
+	return OpenWindowTags(NULL,
+					WA_Left, left,
+					WA_Top, top,
+					WA_InnerWidth, width,
+					WA_InnerHeight, height,
+					WA_PubScreen, (ULONG)screen,
+					WA_Backdrop, FALSE,
+					WA_Borderless, FALSE,
+					WA_DragBar, TRUE,
+					WA_DepthGadget, TRUE,
+					WA_CloseGadget, TRUE,
+					WA_Activate, TRUE,
+					WA_SimpleRefresh, TRUE,
+					WA_NoCareRefresh, TRUE,
+					WA_ReportMouse, FALSE,
+					WA_RMBTrap, TRUE,
+					WA_IDCMP, IDCMP_CLOSEWINDOW|IDCMP_ACTIVEWINDOW|IDCMP_INACTIVEWINDOW,
+					TAG_END);
+
+}
+
 int main(int argc, char **argv) {
     struct timeval t1, t2;
     double elapsedtime;
     static GLint frames = 0;
     ULONG modeId = INVALID_ID;
+    int fullscreen = 1;
+
+    if (_WBenchMsg) {
+    	struct DiskObject *diskObject;
+
+		// Process Tooltypes.
+		diskObject = GetDiskObject((char*)_WBenchMsg->sm_ArgList[0].wa_Name);
+		if (diskObject != NULL) {
+			// Process DOS command line flags.
+			if (FindToolType(diskObject->do_ToolTypes, "windowed") != NULL) {
+				fullscreen = 0;
+			}
+		}
+    }
 
     // start timer
     gettimeofday(&t1, NULL);
 
 	atexit(exitT);
 
-	CyberGfxBase = OpenLibrary((UBYTE* )"cybergraphics.library", 0);
+	Picasso96Base = OpenLibrary("picasso96api.library", 2);
 
-	modeId = getCyberModeId(WIDTH, HEIGHT, DEPTH);
+	modeId = getP96Mode32(WIDTH, HEIGHT);
 
-	_hardwareScreen = CreateHardwareScreen(modeId, WIDTH, HEIGHT, DEPTH);
+	if (fullscreen) {
+		_customScreen = CreateHardwareScreen(modeId, WIDTH, HEIGHT, p96GetModeIDAttr(modeId, P96IDA_BITSPERPIXEL));
+		_hardwareWindow = CreateHardwareWindowFullScreen(WIDTH, HEIGHT, _customScreen);
+	} else {
+		struct Screen* defaultScreen;
 
-	_hardwareWindow = CreateHardwareWindowFullScreen(WIDTH, HEIGHT, _hardwareScreen);
+		defaultScreen = LockPubScreen(NULL);
+		_hardwareWindow = CreateHardwareWindow(WIDTH, HEIGHT, defaultScreen);
+		UnlockPubScreen(NULL, defaultScreen);
+	}
 
 	SetPointer(_hardwareWindow, (UWORD* )_blankCursor, 1, 1, 0, 0);
 
 	context = amesa_create_context(_hardwareWindow);
-
 	amesa_make_current(context);
 
 	init();
 
-	while (frames < 120) {
+	while (frames < 240) {
 		draw();
 		angle += 2.0;
 		frames++;
