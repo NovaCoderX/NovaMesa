@@ -365,20 +365,38 @@ Done, measured on `timedemo demo1` at 320x240 (x86-32 instruction counts):
    each paying dualtex's float setup, drawn with depth func GEQUAL so the
    span reject does not apply.
 
-Together demo1 -13.6% (29.77 G -> 25.71 G); the first two alone were demo1
--11.6%, demo2 -13.2%. Not run as m68k code this round: the
+6. **Depth test and write in one loop for the textured fast paths.** New
+   optional driver hook `WriteRGBASpanDepth` (`swrast.h`), implemented by
+   `write_rgba_span_depth` in the driver. `span_direct_ok()` decides per
+   triangle: `_RasterMask == (DEPTH_BIT | TEXTURE_BIT)`, depth func LESS or
+   LEQUAL with depth writes, no stipple, 16-bit software depth buffer.
+   `write_textured_span()` then replaces the call to `_mesa_write_rgba_span`
+   at the end of `dualtex_span`, `affine_span`, `fast_persp_span` and
+   `affine_mip_span`: one loop instead of Z interpolation, depth test, the
+   generic writer's bookkeeping and the masked driver write. The colours
+   still go through the span's RGBA array, so the texturing loops are not
+   duplicated and fog, blend and masking are untouched (any of them simply
+   makes the state ineligible). 25.71 G -> 23.93 G (-6.9%). Byte-identical:
+   every frame of three demos and the sky scene, `bench` and `geom`.
+
+Together demo1 -19.6% (29.77 G -> 23.93 G) and demo2 -21.0%
+(33.46 G -> 26.45 G). `bench` over all its configurations -13%, `geom` -1.4%,
+so nothing else got slower. Not run as m68k code this round: the
 cross compiler could not be installed in the session. Neither change depends
 on byte order (bytes and whole ARGB words only), but run the qemu check
 before relying on that.
 
-Next candidates from the same profile, best first:
+What the demo1 profile looks like now: `dualtex_triangle` 64% (the texturing
+loops and their per-16-pixel setup), its triangle setup 10%,
+`write_rgba_span_depth` 9.4%. Candidates from here:
 
-- **A dualtex variant that tests and writes Z and ARGB itself** for the plain
-  world state (depth LESS/LEQUAL with writes, no blend, alpha test, fog or
-  stencil). After texturing, every span still goes through
-  `_mesa_span_interpolate_z`, `depth_test_span`, `_mesa_write_rgba_span` and
-  the driver's `write_rgba_span`: about 13.5% of a frame. Needs a way for
-  swrast to reach the driver's rows, like the blend hooks.
+- Write ARGB straight from the texturing loops with the depth test first, so
+  hidden pixels are not textured and the RGBA array round trip goes away.
+  Only 3.7% of textured pixels are hidden in demo1, so this is mostly the
+  store path: a few percent, for a second copy of every dualtex loop.
+- Share the perspective divide between the two units in `dualtex_span` when
+  their `q` is the same (it nearly always is).
+- The sky: several hundred small quads a frame, see item 5.
 
 ## Ideas not done yet
 
@@ -397,8 +415,9 @@ Next candidates from the same profile, best first:
 
 Other ideas noted but deliberately left alone:
 
-- Direct-to-buffer writes for the *textured* paths. Means duplicating fog,
-  blend and masking per path.
+- Direct-to-buffer writes for the *textured* paths from inside the texturing
+  loops. The fifth round did the cheap half of this (one combined depth and
+  write loop after texturing, for the plain state only).
 - Sharing the perspective divide between the two units in `dualtex_span` when
   their `q` is identical (it nearly always is).
 

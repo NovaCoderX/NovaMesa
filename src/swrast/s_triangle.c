@@ -350,6 +350,42 @@ span_hidden( const GLcontext *ctx, const struct sw_span *span )
 
 
 /*
+ * NOVA: the textured fast paths finish by handing an array of colours to
+ * _mesa_write_rgba_span().  In the plainest state -- depth test LESS or
+ * LEQUAL with depth writes, and nothing else enabled -- all that is left to
+ * do is the depth test and the write, and the driver can do both in one loop
+ * (Driver.WriteRGBASpanDepth).  span_direct_ok() says whether the current
+ * state is that plain; write_textured_span() takes the short cut if so.
+ */
+static INLINE GLboolean
+span_direct_ok( const GLcontext *ctx )
+{
+   const SWcontext *swrast = SWRAST_CONTEXT(ctx);
+   return (GLboolean) (swrast->Driver.WriteRGBASpanDepth
+                       && swrast->_RasterMask == (DEPTH_BIT | TEXTURE_BIT)
+                       && ctx->Depth.Mask
+                       && !ctx->Polygon.StippleFlag
+                       && span_zreject_ok(ctx));
+}
+
+static INLINE void
+write_textured_span( GLcontext *ctx, struct sw_span *span, GLboolean direct )
+{
+   if (direct) {
+      const GLint passed = (*SWRAST_CONTEXT(ctx)->Driver.WriteRGBASpanDepth)
+         (ctx, span->end, span->x, span->y,
+          (const GLchan (*)[4]) span->array->rgba, span->z, span->zStep);
+      if (passed >= 0) {
+         if (passed)
+            ctx->OcclusionResult = GL_TRUE;   /* as _mesa_write_rgba_span() */
+         return;
+      }
+   }
+   _mesa_write_rgba_span(ctx, span);
+}
+
+
+/*
  * NOVA: is perspective correction worth doing for this triangle?
  *
  * It only matters when 1/w differs noticeably between the vertices.  For
@@ -461,6 +497,7 @@ struct affine_info
    GLint tbytesline, tsize;
    /* NOVA: */
    GLboolean zReject;                     /* see span_zreject_ok() */
+   GLboolean zDirect;                     /* see span_direct_ok() */
    const struct gl_texture_object *obj;   /* perspective path only */
    GLint maxLevel;                        /* perspective path only: highest
                                            * mip level usable above BaseLevel */
@@ -768,7 +805,7 @@ affine_span(GLcontext *ctx, struct sw_span *span,
 
    span->interpMask &= ~SPAN_RGBA;
    ASSERT(span->arrayMask & SPAN_RGBA);
-   _mesa_write_rgba_span(ctx, span);
+   write_textured_span(ctx, span, info->zDirect);  /* NOVA */
 }
 
 
@@ -805,6 +842,7 @@ static void affine_textured_triangle( GLcontext *ctx,
    info.filter = obj->MinFilter;					\
    info.envmode = affine_envmode(unit);					\
    info.zReject = span_zreject_ok(ctx);					\
+   info.zDirect = span_direct_ok(ctx);					\
    span.arrayMask |= SPAN_RGBA;						\
 									\
    if (info.envmode == GL_BLEND) {					\
@@ -973,7 +1011,7 @@ fast_persp_span(GLcontext *ctx, struct sw_span *span,
    }
 
    ASSERT(span->arrayMask & SPAN_RGBA);
-   _mesa_write_rgba_span(ctx, span);
+   write_textured_span(ctx, span, base->zDirect);  /* NOVA */
 }
 
 
@@ -1008,6 +1046,7 @@ static void persp_textured_triangle_full( GLcontext *ctx,
    info.filter = obj->MagFilter;					\
    info.envmode = affine_envmode(unit);					\
    info.zReject = span_zreject_ok(ctx);					\
+   info.zDirect = span_direct_ok(ctx);					\
    info.obj = obj;							\
    info.maxLevel = (obj->MinFilter == obj->MagFilter)			\
                  ? 0 : (obj->_MaxLevel - obj->BaseLevel);		\
@@ -1116,7 +1155,7 @@ affine_mip_span(GLcontext *ctx, struct sw_span *span, struct affine_info *info,
 
    span->interpMask &= ~SPAN_RGBA;
    ASSERT(span->arrayMask & SPAN_RGBA);
-   _mesa_write_rgba_span(ctx, span);
+   write_textured_span(ctx, span, info->zDirect);  /* NOVA */
 }
 
 
@@ -1152,6 +1191,7 @@ static void affine_mip_textured_triangle( GLcontext *ctx,
    info.filter = obj->MagFilter;					\
    info.envmode = affine_envmode(unit);					\
    info.zReject = span_zreject_ok(ctx);					\
+   info.zDirect = span_direct_ok(ctx);					\
    info.obj = obj;							\
    info.maxLevel = (obj->MinFilter == obj->MagFilter)			\
                  ? 0 : (obj->_MaxLevel - obj->BaseLevel);		\
@@ -1261,6 +1301,7 @@ struct dualtex_info
                               * times 1, 2 or 4 (shift 0, 1, 2); -1 if unit 0
                               * is GL_REPLACE */
    GLboolean zReject;        /* can spans be pre-tested against the Z buffer? */
+   GLboolean zDirect;        /* see span_direct_ok() */
 };
 
 
@@ -1434,6 +1475,7 @@ dualtex_setup( const GLcontext *ctx, struct dualtex_info *info )
    }
 
    info->zReject = span_zreject_ok(ctx);
+   info->zDirect = span_direct_ok(ctx);
    return GL_TRUE;
 }
 
@@ -1840,7 +1882,7 @@ dualtex_span( GLcontext *ctx, struct sw_span *span,
    }
 
    ASSERT(span->arrayMask & SPAN_RGBA);
-   _mesa_write_rgba_span(ctx, span);
+   write_textured_span(ctx, span, info->zDirect);  /* NOVA */
 }
 
 #undef DUALTEX_LERP

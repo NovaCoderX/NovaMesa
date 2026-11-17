@@ -551,6 +551,31 @@ struct swrast_device_driver {
                                  GLuint n, const GLint x[], const GLint y[],
                                  CONST GLchan rgba[][4], const GLubyte mask[] );
 
+   /***
+    *** NOVA: optional.  Depth test a span of finished colours against the
+    *** 16-bit software depth buffer and write the pixels that pass, and their
+    *** depths, in one loop.
+    ***
+    *** For a textured span in the plainest state swrast otherwise makes four
+    *** passes after texturing: interpolate Z into an array, test it and build
+    *** a mask, the bookkeeping of _mesa_write_rgba_span(), and the driver's
+    *** masked write with its pixel format conversion.
+    ***
+    *** z and zStep are the span's fixed-point depth and step; pixel i has
+    *** depth FixedToInt(z + i * zStep), as _mesa_span_interpolate_z() computes
+    *** it.  Use ctx->Depth.Func, which is GL_LESS or GL_LEQUAL.  Only called
+    *** when depth writes are on and nothing else touches the fragments: no
+    *** alpha test, stencil, blend, fog, logic op, colour mask, scissor,
+    *** stipple or software alpha, and exactly one colour buffer.
+    ***
+    *** Return -1 to decline (swrast then does it the long way), 0 if no
+    *** pixel passed, 1 if any did.
+    ***/
+   GLint (*WriteRGBASpanDepth)( const GLcontext *ctx,
+                                GLuint n, GLint x, GLint y,
+                                CONST GLchan rgba[][4],
+                                GLfixed z, GLfixed zStep );
+
 
 
    /***
