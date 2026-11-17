@@ -73,7 +73,8 @@ bias and clamps.
 Things that push an application onto the slow general path:
 
 - trilinear filtering (`*_MIPMAP_LINEAR`), or min and mag filters that disagree
-- `GL_COMBINE` on a single unit, three or more units, DECAL/ADD/BLEND on unit 1
+- `GL_COMBINE` on a single unit other than modulate with an RGB scale (fifth
+  round), three or more units, DECAL/ADD/BLEND on unit 1
 - wrap modes other than `GL_REPEAT`, texture borders, non-RGB/RGBA formats
 - blend functions other than the special-cased ones in
   `_swrast_choose_blend_func` (the rest use float `blend_general`)
@@ -328,8 +329,20 @@ Done, measured on `timedemo demo1` at 320x240 (x86-32 instruction counts):
    pixel. 27.08 G -> 26.33 G (-2.8%); byte-identical everywhere.
 3. `is_fan_like[]` in `tnl/t_imm_fixup.c` was indexed one to three entries
    past its end outside `glBegin` (old Mesa bug, found with AddressSanitizer).
+4. **Single-unit `GL_COMBINE` as scaled modulate.** `combine_is_scaled_modulate()`
+   accepts RGB = TEXTURE * PRIMARY (or PREVIOUS) with scale 1, 2 or 4 and the
+   default alpha combine; the affine and perspective paths then run it as
+   `GL_MODULATE` with a shift and a clamp (`MODULATE_SCALED` in `affine_fill`,
+   `AFFINE_ENV_MODULATE_2X/4X` in `affine_info.envmode`). This is FitzQuake's
+   overbright alias model without a fullbright mask, which used to be on
+   `general_textured_triangle`. 26.33 G -> 26.13 G (-0.8%) on x86, where the
+   float path is cheap; expect more on a 68k and much more under a software
+   FPU. Not identical: like the other fast paths it picks a neighbouring
+   texel here and there (0.5% of pixels differ, 0.05% by more than 8/255, all
+   on the models). `bench` and `geom` are byte-identical.
 
-Together demo1 -11.6%, demo2 -13.2%. Not run as m68k code this round: the
+Together demo1 -12.2% (29.77 G -> 26.13 G); the first two alone were demo1
+-11.6%, demo2 -13.2%. Not run as m68k code this round: the
 cross compiler could not be installed in the session. Neither change depends
 on byte order (bytes and whole ARGB words only), but run the qemu check
 before relying on that.
@@ -345,9 +358,12 @@ Next candidates from the same profile, best first:
 - **`GL_DECAL` with an RGBA texture on unit 1 in the dualtex path** (Quake's
   sky, depth func GEQUAL). It is on `multitextured_triangle` and a sky pixel
   costs about 2.6 times a world pixel; the sky is 61% of an open view.
-- **Single-unit `GL_COMBINE` modulate with RGB scale** (alias models with
-  overbright) is on `general_textured_triangle`. 1.4% on x86; more where
-  float is slow.
+- **Alias models with a fullbright mask** (unit 0 scaled-modulate combine,
+  unit 1 `GL_DECAL` with an RGBA texture, same texcoords, blend enabled but a
+  no-op) are still on `multitextured_triangle`: 6% of demo1, most of it the
+  view weapon. Having FitzQuake draw them in two passes instead (scaled
+  modulate, then the mask blended) was measured at only -0.3% on x86, so the
+  gain has to come from a two-unit integer path with a vertex colour.
 
 ## Ideas not done yet
 

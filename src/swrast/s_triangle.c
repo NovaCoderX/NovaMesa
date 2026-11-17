@@ -392,6 +392,63 @@ triangle_is_near_affine( const SWvertex *v0, const SWvertex *v1,
 }
 
 
+/*
+ * NOVA: GL_COMBINE on a single unit normally means the general float path.
+ * One combine setting is just GL_MODULATE followed by a shift, and is what
+ * applications use to get overbright vertex lighting on a texture:
+ *
+ *    RGB   = TEXTURE * PRIMARY_COLOR * scale    (scale 1, 2 or 4)
+ *    alpha = TEXTURE * PRIMARY_COLOR            (the default alpha combine)
+ *
+ * The integer paths handle that as an env mode of their own.  These two
+ * values stand for it in affine_info.envmode; they are not GL enums.
+ */
+#define AFFINE_ENV_MODULATE_2X  0x7fff0001
+#define AFFINE_ENV_MODULATE_4X  0x7fff0002
+
+static GLboolean
+combine_is_scaled_modulate( const struct gl_texture_unit *unit )
+{
+#define IS_TEX(S)   ((S) == GL_TEXTURE)
+#define IS_PRIM(S)  ((S) == GL_PRIMARY_COLOR_EXT || (S) == GL_PREVIOUS_EXT)
+   if (unit->EnvMode != GL_COMBINE_EXT
+       || unit->CombineModeRGB != GL_MODULATE
+       || unit->CombineModeA != GL_MODULATE
+       || unit->CombineOperandRGB[0] != GL_SRC_COLOR
+       || unit->CombineOperandRGB[1] != GL_SRC_COLOR
+       || unit->CombineOperandA[0] != GL_SRC_ALPHA
+       || unit->CombineOperandA[1] != GL_SRC_ALPHA
+       || unit->CombineScaleShiftRGB > 2
+       || unit->CombineScaleShiftA != 0)
+      return GL_FALSE;
+   /* on unit 0 "previous" is the primary colour */
+   if (!((IS_TEX(unit->CombineSourceRGB[0]) && IS_PRIM(unit->CombineSourceRGB[1])) ||
+         (IS_PRIM(unit->CombineSourceRGB[0]) && IS_TEX(unit->CombineSourceRGB[1]))))
+      return GL_FALSE;
+   if (!((IS_TEX(unit->CombineSourceA[0]) && IS_PRIM(unit->CombineSourceA[1])) ||
+         (IS_PRIM(unit->CombineSourceA[0]) && IS_TEX(unit->CombineSourceA[1]))))
+      return GL_FALSE;
+   return GL_TRUE;
+#undef IS_TEX
+#undef IS_PRIM
+}
+
+/* The env mode affine_fill() should use for this unit. */
+static GLenum
+affine_envmode( const struct gl_texture_unit *unit )
+{
+   if (unit->EnvMode == GL_COMBINE_EXT) {
+      /* only reached when combine_is_scaled_modulate() said yes */
+      switch (unit->CombineScaleShiftRGB) {
+      case 1:  return AFFINE_ENV_MODULATE_2X;
+      case 2:  return AFFINE_ENV_MODULATE_4X;
+      default: return GL_MODULATE;
+      }
+   }
+   return unit->EnvMode;
+}
+
+
 struct affine_info
 {
    GLenum filter;
@@ -464,6 +521,18 @@ affine_fill(struct sw_span *span, const struct affine_info *info,
    dest[GCOMP] = span->green * (sample[GCOMP] + 1u) >> (FIXED_SHIFT + 8); \
    dest[BCOMP] = span->blue  * (sample[BCOMP] + 1u) >> (FIXED_SHIFT + 8); \
    dest[ACOMP] = span->alpha * (sample[ACOMP] + 1u) >> (FIXED_SHIFT + 8)
+
+/* NOVA: GL_MODULATE times 2 (SH 1) or 4 (SH 2), clamped; alpha unscaled */
+#define MODULATE_SCALED(SH)						  \
+   {									  \
+      GLuint mr = span->red   * (sample[RCOMP] + 1u) >> (FIXED_SHIFT + 8 - (SH)); \
+      GLuint mg = span->green * (sample[GCOMP] + 1u) >> (FIXED_SHIFT + 8 - (SH)); \
+      GLuint mb = span->blue  * (sample[BCOMP] + 1u) >> (FIXED_SHIFT + 8 - (SH)); \
+      dest[RCOMP] = (GLchan) MIN2(mr, CHAN_MAX);			  \
+      dest[GCOMP] = (GLchan) MIN2(mg, CHAN_MAX);			  \
+      dest[BCOMP] = (GLchan) MIN2(mb, CHAN_MAX);			  \
+      dest[ACOMP] = span->alpha * (sample[ACOMP] + 1u) >> (FIXED_SHIFT + 8); \
+   }
 
 #define DECAL								\
    dest[RCOMP] = ((CHAN_MAX - sample[ACOMP]) * span->red +		\
@@ -574,6 +643,12 @@ affine_fill(struct sw_span *span, const struct affine_info *info,
          case GL_MODULATE:
             SPAN_NEAREST(NEAREST_RGB;MODULATE,3);
             break;
+         case AFFINE_ENV_MODULATE_2X:
+            SPAN_NEAREST(NEAREST_RGB;MODULATE_SCALED(1),3);
+            break;
+         case AFFINE_ENV_MODULATE_4X:
+            SPAN_NEAREST(NEAREST_RGB;MODULATE_SCALED(2),3);
+            break;
          case GL_DECAL:
          case GL_REPLACE:
             SPAN_NEAREST(NEAREST_RGB_REPLACE,3);
@@ -592,6 +667,12 @@ affine_fill(struct sw_span *span, const struct affine_info *info,
          switch(info->envmode) {
          case GL_MODULATE:
             SPAN_NEAREST(NEAREST_RGBA;MODULATE,4);
+            break;
+         case AFFINE_ENV_MODULATE_2X:
+            SPAN_NEAREST(NEAREST_RGBA;MODULATE_SCALED(1),4);
+            break;
+         case AFFINE_ENV_MODULATE_4X:
+            SPAN_NEAREST(NEAREST_RGBA;MODULATE_SCALED(2),4);
             break;
          case GL_DECAL:
             SPAN_NEAREST(NEAREST_RGBA;DECAL,4);
@@ -621,6 +702,12 @@ affine_fill(struct sw_span *span, const struct affine_info *info,
          case GL_MODULATE:
             SPAN_LINEAR(LINEAR_RGB;MODULATE,3);
             break;
+         case AFFINE_ENV_MODULATE_2X:
+            SPAN_LINEAR(LINEAR_RGB;MODULATE_SCALED(1),3);
+            break;
+         case AFFINE_ENV_MODULATE_4X:
+            SPAN_LINEAR(LINEAR_RGB;MODULATE_SCALED(2),3);
+            break;
          case GL_DECAL:
          case GL_REPLACE:
             SPAN_LINEAR(LINEAR_RGB;REPLACE,3);
@@ -639,6 +726,12 @@ affine_fill(struct sw_span *span, const struct affine_info *info,
          switch (info->envmode) {
          case GL_MODULATE:
             SPAN_LINEAR(LINEAR_RGBA;MODULATE,4);
+            break;
+         case AFFINE_ENV_MODULATE_2X:
+            SPAN_LINEAR(LINEAR_RGBA;MODULATE_SCALED(1),4);
+            break;
+         case AFFINE_ENV_MODULATE_4X:
+            SPAN_LINEAR(LINEAR_RGBA;MODULATE_SCALED(2),4);
             break;
          case GL_DECAL:
             SPAN_LINEAR(LINEAR_RGBA;DECAL,4);
@@ -710,7 +803,7 @@ static void affine_textured_triangle( GLcontext *ctx,
    info.tmask = obj->Image[b]->Height - 1;				\
    info.format = obj->Image[b]->Format;					\
    info.filter = obj->MinFilter;					\
-   info.envmode = unit->EnvMode;					\
+   info.envmode = affine_envmode(unit);					\
    info.zReject = span_zreject_ok(ctx);					\
    span.arrayMask |= SPAN_RGBA;						\
 									\
@@ -913,7 +1006,7 @@ static void persp_textured_triangle_full( GLcontext *ctx,
    info.tmask = obj->Image[b]->Height - 1;				\
    info.format = obj->Image[b]->Format;					\
    info.filter = obj->MagFilter;					\
-   info.envmode = unit->EnvMode;					\
+   info.envmode = affine_envmode(unit);					\
    info.zReject = span_zreject_ok(ctx);					\
    info.obj = obj;							\
    info.maxLevel = (obj->MinFilter == obj->MagFilter)			\
@@ -1057,7 +1150,7 @@ static void affine_mip_textured_triangle( GLcontext *ctx,
    info.tmask = obj->Image[b]->Height - 1;				\
    info.format = obj->Image[b]->Format;					\
    info.filter = obj->MagFilter;					\
-   info.envmode = unit->EnvMode;					\
+   info.envmode = affine_envmode(unit);					\
    info.zReject = span_zreject_ok(ctx);					\
    info.obj = obj;							\
    info.maxLevel = (obj->MinFilter == obj->MagFilter)			\
@@ -1913,7 +2006,12 @@ _swrast_choose_triangle( GLcontext *ctx )
 #endif
                  )
 	     && ctx->Light.Model.ColorControl == GL_SINGLE_COLOR
-	     && ctx->Texture.Unit[0].EnvMode != GL_COMBINE_EXT) {
+	     && (ctx->Texture.Unit[0].EnvMode != GL_COMBINE_EXT
+#if CHAN_BITS == 8
+                 /* NOVA: modulate with an RGB scale, see affine_envmode() */
+                 || combine_is_scaled_modulate(&ctx->Texture.Unit[0])
+#endif
+                 )) {
 	    if (ctx->Hint.PerspectiveCorrection==GL_FASTEST
                 && minFilter == magFilter) {
 	       if (minFilter == GL_NEAREST
