@@ -412,7 +412,13 @@ copy_material( struct immediate *next,
 
 
 
-static GLboolean is_fan_like[GL_POLYGON+1] = {
+/* NOVA: indexed with ctx->Driver.CurrentExecPrimitive, which is not always
+ * a real primitive: outside glBegin/glEnd it is PRIM_OUTSIDE_BEGIN_END
+ * (GL_POLYGON+1), and it can be PRIM_INSIDE_UNKNOWN_PRIM or PRIM_UNKNOWN
+ * (+2, +3).  The table stopped at GL_POLYGON, so every flush outside a
+ * primitive read whatever byte followed it.
+ */
+static GLboolean is_fan_like[PRIM_UNKNOWN+1] = {
    GL_FALSE,
    GL_FALSE,
    GL_TRUE,			/* line loop */
@@ -422,7 +428,10 @@ static GLboolean is_fan_like[GL_POLYGON+1] = {
    GL_TRUE,			/* tri fan */
    GL_FALSE,
    GL_FALSE,
-   GL_TRUE			/* polygon */
+   GL_TRUE,			/* polygon */
+   GL_FALSE,			/* PRIM_OUTSIDE_BEGIN_END */
+   GL_FALSE,			/* PRIM_INSIDE_UNKNOWN_PRIM */
+   GL_FALSE			/* PRIM_UNKNOWN */
 };
 
 

@@ -654,6 +654,132 @@ static void flat_triangle(GLcontext* ctx, const SWvertex* v0, const SWvertex* v1
 #include "swrast/s_tritemp.h"
 }
 
+/*
+ * NOVA: flat shaded and blended, no depth test.  This is what a full-screen
+ * tint is (Quake's damage, pickup and underwater blends): one constant colour
+ * blended over every pixel.  Through swrast that meant filling a colour array
+ * per span, the generic span code and then the blend hook, about a hundred
+ * instructions a pixel for what is one blend with a fixed source.  The blend
+ * functions are the ones blend_rgba_span() uses, so the result is the same.
+ *
+ * For a large triangle the blend is turned into four 256-entry tables first.
+ * All four blend modes work on each channel separately, and the source is
+ * constant, so each channel of the result depends only on the same channel
+ * of the destination.  The tables are filled by calling the blend function
+ * itself, so they cannot disagree with it, and they are kept until the
+ * colour or mode changes (the two triangles of a quad share them).
+ */
+#define AMESA_BLEND_LUT_MIN_AREA 8192.0F	/* twice the area in pixels: about 4000 pixels */
+
+static GLuint amesa_blend_lut[4][256];		/* A, R, G, B, each already in its place in the pixel */
+static GLint amesa_blend_lut_mode = AMESA_BLEND_NONE;
+static GLuint amesa_blend_lut_src;
+
+static void amesa_build_blend_lut(GLint mode, const GLubyte* src) {
+	const GLuint key = ((GLuint) src[0] << 24) | ((GLuint) src[1] << 16) | ((GLuint) src[2] << 8) | (GLuint) src[3];
+	GLuint v;
+
+	if (mode == amesa_blend_lut_mode && key == amesa_blend_lut_src) {
+		return;
+	}
+
+	for (v = 0; v < 256; v++) {
+		const GLuint d = v * 0x01010101u;	/* destination with v in every channel */
+		GLuint p;
+
+		switch (mode) {
+			case AMESA_BLEND_TRANSPARENCY:
+				p = amesa_blend_transparency(src, d);
+				break;
+			case AMESA_BLEND_ADD:
+				p = amesa_blend_add(src, d);
+				break;
+			case AMESA_BLEND_MODULATE:
+				p = amesa_blend_modulate(src, d);
+				break;
+			default:
+				p = amesa_blend_modulate2x(src, d);
+				break;
+		}
+
+		amesa_blend_lut[0][v] = p & 0xff000000u;
+		amesa_blend_lut[1][v] = p & 0x00ff0000u;
+		amesa_blend_lut[2][v] = p & 0x0000ff00u;
+		amesa_blend_lut[3][v] = p & 0x000000ffu;
+	}
+
+	amesa_blend_lut_mode = mode;
+	amesa_blend_lut_src = key;
+}
+
+/* oneOverArea comes from s_tritemp.h; its sign is the winding. */
+#define AMESA_FLAT_BLEND_SETUP(MODE) \
+	const GLboolean useLut = (GLboolean) (oneOverArea > -1.0F / AMESA_BLEND_LUT_MIN_AREA \
+			&& oneOverArea < 1.0F / AMESA_BLEND_LUT_MIN_AREA); \
+	if (useLut) \
+		amesa_build_blend_lut(MODE, src);
+
+#define AMESA_FLAT_BLEND_SPAN(FUNC) \
+	GLuint i; \
+	if (useLut) { \
+		for (i = 0; i < span.end; i++) { \
+			const GLuint d = pRow[i]; \
+			pRow[i] = amesa_blend_lut[0][d >> 24] | amesa_blend_lut[1][(d >> 16) & 0xff] \
+				| amesa_blend_lut[2][(d >> 8) & 0xff] | amesa_blend_lut[3][d & 0xff]; \
+		} \
+	} else { \
+		for (i = 0; i < span.end; i++) { \
+			pRow[i] = FUNC(src, pRow[i]); \
+		} \
+	}
+
+static void flat_blend_transparency_triangle(GLcontext* ctx, const SWvertex* v0, const SWvertex* v1, const SWvertex* v2) {
+	AMESA_TRI_COMMON
+	const GLubyte* const src = v2->color;
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define SETUP_CODE \
+	if (src[ACOMP] == 0) \
+		return;		/* fully transparent: nothing changes */ \
+	AMESA_FLAT_BLEND_SETUP(AMESA_BLEND_TRANSPARENCY)
+#define RENDER_SPAN(span) AMESA_FLAT_BLEND_SPAN(amesa_blend_transparency)
+#include "swrast/s_tritemp.h"
+}
+
+static void flat_blend_add_triangle(GLcontext* ctx, const SWvertex* v0, const SWvertex* v1, const SWvertex* v2) {
+	AMESA_TRI_COMMON
+	const GLubyte* const src = v2->color;
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define SETUP_CODE AMESA_FLAT_BLEND_SETUP(AMESA_BLEND_ADD)
+#define RENDER_SPAN(span) AMESA_FLAT_BLEND_SPAN(amesa_blend_add)
+#include "swrast/s_tritemp.h"
+}
+
+static void flat_blend_modulate_triangle(GLcontext* ctx, const SWvertex* v0, const SWvertex* v1, const SWvertex* v2) {
+	AMESA_TRI_COMMON
+	const GLubyte* const src = v2->color;
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define SETUP_CODE AMESA_FLAT_BLEND_SETUP(AMESA_BLEND_MODULATE)
+#define RENDER_SPAN(span) AMESA_FLAT_BLEND_SPAN(amesa_blend_modulate)
+#include "swrast/s_tritemp.h"
+}
+
+static void flat_blend_modulate2x_triangle(GLcontext* ctx, const SWvertex* v0, const SWvertex* v1, const SWvertex* v2) {
+	AMESA_TRI_COMMON
+	const GLubyte* const src = v2->color;
+#define PIXEL_TYPE GLuint
+#define BYTES_PER_ROW (a_ctx->pitch)
+#define PIXEL_ADDRESS(X, Y) (a_ctx->row[Y] + (X))
+#define SETUP_CODE AMESA_FLAT_BLEND_SETUP(AMESA_BLEND_MODULATE2X)
+#define RENDER_SPAN(span) AMESA_FLAT_BLEND_SPAN(amesa_blend_modulate2x)
+#include "swrast/s_tritemp.h"
+}
+
 /**********************************************************************/
 /* NOVA: untextured lines and points drawn straight into the buffer    */
 /**********************************************************************/
@@ -925,6 +1051,24 @@ static void amesa_choose_triangle(GLcontext* ctx) {
 		} else if (swrast->_RasterMask == 0) {
 			swrast->Triangle = smooth ? smooth_triangle : flat_triangle;
 			return;
+		} else if (swrast->_RasterMask == BLEND_BIT && !smooth) {
+			// NOVA: one constant colour blended over the triangle
+			switch (amesa_blend_mode(ctx)) {
+				case AMESA_BLEND_TRANSPARENCY:
+					swrast->Triangle = flat_blend_transparency_triangle;
+					return;
+				case AMESA_BLEND_ADD:
+					swrast->Triangle = flat_blend_add_triangle;
+					return;
+				case AMESA_BLEND_MODULATE:
+					swrast->Triangle = flat_blend_modulate_triangle;
+					return;
+				case AMESA_BLEND_MODULATE2X:
+					swrast->Triangle = flat_blend_modulate2x_triangle;
+					return;
+				default:
+					break;	// any other blend: swrast
+			}
 		}
 	}
 

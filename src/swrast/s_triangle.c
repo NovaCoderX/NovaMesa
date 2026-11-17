@@ -392,6 +392,63 @@ triangle_is_near_affine( const SWvertex *v0, const SWvertex *v1,
 }
 
 
+/*
+ * NOVA: GL_COMBINE on a single unit normally means the general float path.
+ * One combine setting is just GL_MODULATE followed by a shift, and is what
+ * applications use to get overbright vertex lighting on a texture:
+ *
+ *    RGB   = TEXTURE * PRIMARY_COLOR * scale    (scale 1, 2 or 4)
+ *    alpha = TEXTURE * PRIMARY_COLOR            (the default alpha combine)
+ *
+ * The integer paths handle that as an env mode of their own.  These two
+ * values stand for it in affine_info.envmode; they are not GL enums.
+ */
+#define AFFINE_ENV_MODULATE_2X  0x7fff0001
+#define AFFINE_ENV_MODULATE_4X  0x7fff0002
+
+static GLboolean
+combine_is_scaled_modulate( const struct gl_texture_unit *unit )
+{
+#define IS_TEX(S)   ((S) == GL_TEXTURE)
+#define IS_PRIM(S)  ((S) == GL_PRIMARY_COLOR_EXT || (S) == GL_PREVIOUS_EXT)
+   if (unit->EnvMode != GL_COMBINE_EXT
+       || unit->CombineModeRGB != GL_MODULATE
+       || unit->CombineModeA != GL_MODULATE
+       || unit->CombineOperandRGB[0] != GL_SRC_COLOR
+       || unit->CombineOperandRGB[1] != GL_SRC_COLOR
+       || unit->CombineOperandA[0] != GL_SRC_ALPHA
+       || unit->CombineOperandA[1] != GL_SRC_ALPHA
+       || unit->CombineScaleShiftRGB > 2
+       || unit->CombineScaleShiftA != 0)
+      return GL_FALSE;
+   /* on unit 0 "previous" is the primary colour */
+   if (!((IS_TEX(unit->CombineSourceRGB[0]) && IS_PRIM(unit->CombineSourceRGB[1])) ||
+         (IS_PRIM(unit->CombineSourceRGB[0]) && IS_TEX(unit->CombineSourceRGB[1]))))
+      return GL_FALSE;
+   if (!((IS_TEX(unit->CombineSourceA[0]) && IS_PRIM(unit->CombineSourceA[1])) ||
+         (IS_PRIM(unit->CombineSourceA[0]) && IS_TEX(unit->CombineSourceA[1]))))
+      return GL_FALSE;
+   return GL_TRUE;
+#undef IS_TEX
+#undef IS_PRIM
+}
+
+/* The env mode affine_fill() should use for this unit. */
+static GLenum
+affine_envmode( const struct gl_texture_unit *unit )
+{
+   if (unit->EnvMode == GL_COMBINE_EXT) {
+      /* only reached when combine_is_scaled_modulate() said yes */
+      switch (unit->CombineScaleShiftRGB) {
+      case 1:  return AFFINE_ENV_MODULATE_2X;
+      case 2:  return AFFINE_ENV_MODULATE_4X;
+      default: return GL_MODULATE;
+      }
+   }
+   return unit->EnvMode;
+}
+
+
 struct affine_info
 {
    GLenum filter;
@@ -464,6 +521,18 @@ affine_fill(struct sw_span *span, const struct affine_info *info,
    dest[GCOMP] = span->green * (sample[GCOMP] + 1u) >> (FIXED_SHIFT + 8); \
    dest[BCOMP] = span->blue  * (sample[BCOMP] + 1u) >> (FIXED_SHIFT + 8); \
    dest[ACOMP] = span->alpha * (sample[ACOMP] + 1u) >> (FIXED_SHIFT + 8)
+
+/* NOVA: GL_MODULATE times 2 (SH 1) or 4 (SH 2), clamped; alpha unscaled */
+#define MODULATE_SCALED(SH)						  \
+   {									  \
+      GLuint mr = span->red   * (sample[RCOMP] + 1u) >> (FIXED_SHIFT + 8 - (SH)); \
+      GLuint mg = span->green * (sample[GCOMP] + 1u) >> (FIXED_SHIFT + 8 - (SH)); \
+      GLuint mb = span->blue  * (sample[BCOMP] + 1u) >> (FIXED_SHIFT + 8 - (SH)); \
+      dest[RCOMP] = (GLchan) MIN2(mr, CHAN_MAX);			  \
+      dest[GCOMP] = (GLchan) MIN2(mg, CHAN_MAX);			  \
+      dest[BCOMP] = (GLchan) MIN2(mb, CHAN_MAX);			  \
+      dest[ACOMP] = span->alpha * (sample[ACOMP] + 1u) >> (FIXED_SHIFT + 8); \
+   }
 
 #define DECAL								\
    dest[RCOMP] = ((CHAN_MAX - sample[ACOMP]) * span->red +		\
@@ -574,6 +643,12 @@ affine_fill(struct sw_span *span, const struct affine_info *info,
          case GL_MODULATE:
             SPAN_NEAREST(NEAREST_RGB;MODULATE,3);
             break;
+         case AFFINE_ENV_MODULATE_2X:
+            SPAN_NEAREST(NEAREST_RGB;MODULATE_SCALED(1),3);
+            break;
+         case AFFINE_ENV_MODULATE_4X:
+            SPAN_NEAREST(NEAREST_RGB;MODULATE_SCALED(2),3);
+            break;
          case GL_DECAL:
          case GL_REPLACE:
             SPAN_NEAREST(NEAREST_RGB_REPLACE,3);
@@ -592,6 +667,12 @@ affine_fill(struct sw_span *span, const struct affine_info *info,
          switch(info->envmode) {
          case GL_MODULATE:
             SPAN_NEAREST(NEAREST_RGBA;MODULATE,4);
+            break;
+         case AFFINE_ENV_MODULATE_2X:
+            SPAN_NEAREST(NEAREST_RGBA;MODULATE_SCALED(1),4);
+            break;
+         case AFFINE_ENV_MODULATE_4X:
+            SPAN_NEAREST(NEAREST_RGBA;MODULATE_SCALED(2),4);
             break;
          case GL_DECAL:
             SPAN_NEAREST(NEAREST_RGBA;DECAL,4);
@@ -621,6 +702,12 @@ affine_fill(struct sw_span *span, const struct affine_info *info,
          case GL_MODULATE:
             SPAN_LINEAR(LINEAR_RGB;MODULATE,3);
             break;
+         case AFFINE_ENV_MODULATE_2X:
+            SPAN_LINEAR(LINEAR_RGB;MODULATE_SCALED(1),3);
+            break;
+         case AFFINE_ENV_MODULATE_4X:
+            SPAN_LINEAR(LINEAR_RGB;MODULATE_SCALED(2),3);
+            break;
          case GL_DECAL:
          case GL_REPLACE:
             SPAN_LINEAR(LINEAR_RGB;REPLACE,3);
@@ -639,6 +726,12 @@ affine_fill(struct sw_span *span, const struct affine_info *info,
          switch (info->envmode) {
          case GL_MODULATE:
             SPAN_LINEAR(LINEAR_RGBA;MODULATE,4);
+            break;
+         case AFFINE_ENV_MODULATE_2X:
+            SPAN_LINEAR(LINEAR_RGBA;MODULATE_SCALED(1),4);
+            break;
+         case AFFINE_ENV_MODULATE_4X:
+            SPAN_LINEAR(LINEAR_RGBA;MODULATE_SCALED(2),4);
             break;
          case GL_DECAL:
             SPAN_LINEAR(LINEAR_RGBA;DECAL,4);
@@ -710,7 +803,7 @@ static void affine_textured_triangle( GLcontext *ctx,
    info.tmask = obj->Image[b]->Height - 1;				\
    info.format = obj->Image[b]->Format;					\
    info.filter = obj->MinFilter;					\
-   info.envmode = unit->EnvMode;					\
+   info.envmode = affine_envmode(unit);					\
    info.zReject = span_zreject_ok(ctx);					\
    span.arrayMask |= SPAN_RGBA;						\
 									\
@@ -913,7 +1006,7 @@ static void persp_textured_triangle_full( GLcontext *ctx,
    info.tmask = obj->Image[b]->Height - 1;				\
    info.format = obj->Image[b]->Format;					\
    info.filter = obj->MagFilter;					\
-   info.envmode = unit->EnvMode;					\
+   info.envmode = affine_envmode(unit);					\
    info.zReject = span_zreject_ok(ctx);					\
    info.obj = obj;							\
    info.maxLevel = (obj->MinFilter == obj->MagFilter)			\
@@ -1057,7 +1150,7 @@ static void affine_mip_textured_triangle( GLcontext *ctx,
    info.tmask = obj->Image[b]->Height - 1;				\
    info.format = obj->Image[b]->Format;					\
    info.filter = obj->MagFilter;					\
-   info.envmode = unit->EnvMode;					\
+   info.envmode = affine_envmode(unit);					\
    info.zReject = span_zreject_ok(ctx);					\
    info.obj = obj;							\
    info.maxLevel = (obj->MinFilter == obj->MagFilter)			\
@@ -1162,6 +1255,11 @@ struct dualtex_info
 {
    struct dualtex_unit unit[2];
    GLint rgbShift;           /* unit 1 GL_RGB_SCALE as a shift: 0, 1 or 2 */
+   /* NOVA: second mode, unit 1 is GL_DECAL with an RGBA texture */
+   GLboolean decal;
+   GLint mod0Shift;          /* decal mode: unit 0 modulates the vertex colour,
+                              * times 1, 2 or 4 (shift 0, 1, 2); -1 if unit 0
+                              * is GL_REPLACE */
    GLboolean zReject;        /* can spans be pre-tested against the Z buffer? */
 };
 
@@ -1233,6 +1331,22 @@ dualtex_usable( const GLcontext *ctx )
        || ctx->Light.Model.ColorControl != GL_SINGLE_COLOR
        || ctx->Fog.ColorSumEnabled)
       return GL_FALSE;
+
+   /* NOVA: unit 1 laid over unit 0 by its own alpha (GL_DECAL, RGBA).
+    * Unit 0 may replace, or modulate the vertex colour with an optional
+    * RGB scale.  Quake draws its sky with the first and alias models that
+    * have a fullbright mask with the second.
+    */
+   if (unit1->EnvMode == GL_DECAL) {
+      const struct gl_texture_object *obj1 = unit1->_Current;
+      if (unit0->EnvMode != GL_REPLACE && unit0->EnvMode != GL_MODULATE
+          && !combine_is_scaled_modulate(unit0))
+         return GL_FALSE;
+      return dualtex_texture_ok(unit0, GL_TRUE)
+          && dualtex_texture_ok(unit1, GL_TRUE)
+          && obj1->Image[obj1->BaseLevel]->TexFormat->MesaFormat
+             == MESA_FORMAT_RGBA;
+   }
 
    if (unit0->EnvMode != GL_REPLACE)
       return GL_FALSE;
@@ -1309,6 +1423,16 @@ dualtex_setup( const GLcontext *ctx, struct dualtex_info *info )
    info->rgbShift = (unit1->EnvMode == GL_COMBINE_EXT)
                   ? (GLint) unit1->CombineScaleShiftRGB : 0;
 
+   info->decal = (GLboolean) (unit1->EnvMode == GL_DECAL);
+   info->mod0Shift = -1;
+   if (info->decal) {
+      const struct gl_texture_unit *unit0 = &ctx->Texture.Unit[0];
+      if (unit0->EnvMode == GL_MODULATE)
+         info->mod0Shift = 0;
+      else if (unit0->EnvMode == GL_COMBINE_EXT)
+         info->mod0Shift = (GLint) unit0->CombineScaleShiftRGB;
+   }
+
    info->zReject = span_zreject_ok(ctx);
    return GL_TRUE;
 }
@@ -1380,6 +1504,165 @@ dualtex_setup( const GLcontext *ctx, struct dualtex_info *info )
    }
 
 
+/*
+ * NOVA: one sub-span where unit 1 (an RGB texture) is bilinear and
+ * magnified.
+ *
+ * A lightmap has one texel per 16 texels of the surface texture, so on
+ * screen it is usually stretched over many pixels, and filtering it for
+ * every pixel (four fetches and nine lerps) was the largest single cost in
+ * the library for Quake-style scenes.
+ *
+ * While a scanline stays between the same four lightmap texels, the
+ * bilinear result is an exact quadratic in the pixel index:
+ *
+ *    f(k) = c00 + a.u + b.v + c.u.v,   u = u0 + k.du,  v = v0 + k.dv
+ *    a = c01 - c00,  b = c10 - c00,  c = c00 - c01 - c10 + c11
+ *
+ * so it can be stepped with a first and a second difference (two adds per
+ * channel) and only needs setting up again when the scanline moves on to
+ * another texel.  Nothing is approximated and no texel is read that the
+ * per-pixel filter would not read; the result differs from DUALTEX_LINEAR
+ * only in rounding, because that truncates after each of its three lerps.
+ *
+ * Light is kept in 16.16 with the "+ 1" of the modulate folded in.  With
+ * FIXED_SHIFT == 11 and steps of at most a quarter texel the products below
+ * stay inside 31 bits.
+ */
+#define DUALTEX_LMCELL_MAXSTEP (FIXED_ONE / 4)
+
+#define DUALTEX_LMCELL_CHAN(C, L, D, DD)				\
+   {									\
+      const GLint c00 = t00[C];						\
+      const GLint a = (GLint) t01[C] - c00;				\
+      const GLint b = (GLint) t10[C] - c00;				\
+      const GLint c = (GLint) t11[C] - (GLint) t10[C] - a;		\
+      const GLint cdd = (c * ds1 * dt1) >> (2 * FIXED_SHIFT - 16);	\
+      L = (c00 << 16) + 0x10000						\
+        + ((a * u0 + b * v0) << (16 - FIXED_SHIFT))			\
+        + ((((c * u0) >> 3) * v0) >> (2 * FIXED_SHIFT - 16 - 3));	\
+      D = ((a * ds1 + b * dt1) << (16 - FIXED_SHIFT))			\
+        + ((c * (u0 * dt1 + v0 * ds1)) >> (2 * FIXED_SHIFT - 16))	\
+        + cdd;								\
+      DD = 2 * cdd;							\
+   }
+
+#define DUALTEX_LOOP_LMCELL(FETCH0)					\
+   {									\
+      GLint lr = 0, lg = 0, lb = 0;					\
+      GLint dlr = 0, dlg = 0, dlb = 0;					\
+      GLint ddr = 0, ddg = 0, ddb = 0;					\
+      GLfixed cellS = s1 ^ FIXED_ONE, cellT = t1;  /* not this texel */	\
+      for (i = 0; i < n; i++) {						\
+         if (((s1 ^ cellS) | (t1 ^ cellT)) & ~FIXED_FRAC_MASK) {	\
+            /* a new texel: fetch its four corners, set up the steps */	\
+            const GLint col0 = FixedToInt(s1) & wmask1;			\
+            const GLint col1 = (col0 + 1) & wmask1;			\
+            const GLint row0 = (FixedToInt(t1) & hmask1) << wlog1;	\
+            const GLint row1 = ((FixedToInt(t1) + 1) & hmask1) << wlog1;\
+            const GLint u0 = s1 & FIXED_FRAC_MASK;			\
+            const GLint v0 = t1 & FIXED_FRAC_MASK;			\
+            const GLchan *t00 = data1 + 3 * (row0 + col0);		\
+            const GLchan *t01 = data1 + 3 * (row0 + col1);		\
+            const GLchan *t10 = data1 + 3 * (row1 + col0);		\
+            const GLchan *t11 = data1 + 3 * (row1 + col1);		\
+            DUALTEX_LMCELL_CHAN(0, lr, dlr, ddr)			\
+            DUALTEX_LMCELL_CHAN(1, lg, dlg, ddg)			\
+            DUALTEX_LMCELL_CHAN(2, lb, dlb, ddb)			\
+            cellS = s1;							\
+            cellT = t1;							\
+         }								\
+         {								\
+            FETCH0(0, tex0);						\
+            GLuint r = ((GLuint) tex0[0] * (GLuint) (lr >> 16)) >> shift;\
+            GLuint g = ((GLuint) tex0[1] * (GLuint) (lg >> 16)) >> shift;\
+            GLuint b = ((GLuint) tex0[2] * (GLuint) (lb >> 16)) >> shift;\
+            if (shift != 8) {						\
+               if (r > CHAN_MAX) r = CHAN_MAX;				\
+               if (g > CHAN_MAX) g = CHAN_MAX;				\
+               if (b > CHAN_MAX) b = CHAN_MAX;				\
+            }								\
+            dest[RCOMP] = (GLchan) r;					\
+            dest[GCOMP] = (GLchan) g;					\
+            dest[BCOMP] = (GLchan) b;					\
+            dest[ACOMP] = (comps0 == 4) ? tex0[3]			\
+                                        : (GLchan) FixedToInt(alpha);	\
+         }								\
+         alpha += alphaStep;						\
+         s0 += ds0;  t0 += dt0;						\
+         s1 += ds1;  t1 += dt1;						\
+         lr += dlr;  lg += dlg;  lb += dlb;				\
+         dlr += ddr;  dlg += ddg;  dlb += ddb;				\
+         dest += 4;							\
+      }									\
+   }
+
+
+/*
+ * NOVA: one sub-span in decal mode: unit 1 (RGBA) over the result of unit 0,
+ * weighted by unit 1's alpha.  BASE turns the unit 0 texel into r, g, b, a.
+ * The arithmetic is the general path's (CHAN_PRODUCT for the decal, and
+ * texel * (colour + 1) >> shift for the modulate).
+ */
+/* (no commas outside brackets in these two: they are passed on as one
+ * macro argument after being expanded)
+ */
+#define DUALTEX_BASE_REPLACE						\
+   const GLuint r = tex0[0];						\
+   const GLuint g = tex0[1];						\
+   const GLuint b = tex0[2];						\
+   const GLuint a = (comps0 == 4) ? tex0[3] : (GLuint) FixedToInt(alpha);
+
+#define DUALTEX_BASE_MODULATE						\
+   GLuint r = ((GLuint) tex0[0] * ((GLuint) FixedToInt(cr) + 1)) >> mshift;\
+   GLuint g = ((GLuint) tex0[1] * ((GLuint) FixedToInt(cg) + 1)) >> mshift;\
+   GLuint b = ((GLuint) tex0[2] * ((GLuint) FixedToInt(cb) + 1)) >> mshift;\
+   const GLuint a = (comps0 == 4)					\
+      ? ((GLuint) tex0[3] * ((GLuint) FixedToInt(alpha) + 1)) >> 8	\
+      : (GLuint) FixedToInt(alpha);					\
+   if (r > CHAN_MAX) r = CHAN_MAX;					\
+   if (g > CHAN_MAX) g = CHAN_MAX;					\
+   if (b > CHAN_MAX) b = CHAN_MAX;
+
+#define DUALTEX_LOOP_DECAL(FETCH0, FETCH1, BASE)			\
+   for (i = 0; i < n; i++) {						\
+      FETCH0(0, tex0);							\
+      FETCH1(1, tex1);							\
+      BASE								\
+      {									\
+         const GLuint t = tex1[3], inv = CHAN_MAX - t;			\
+         dest[RCOMP] = (GLchan) (CHAN_PRODUCT(r, inv) + CHAN_PRODUCT(tex1[0], t));\
+         dest[GCOMP] = (GLchan) (CHAN_PRODUCT(g, inv) + CHAN_PRODUCT(tex1[1], t));\
+         dest[BCOMP] = (GLchan) (CHAN_PRODUCT(b, inv) + CHAN_PRODUCT(tex1[2], t));\
+         dest[ACOMP] = (GLchan) a;					\
+      }									\
+      alpha += alphaStep;						\
+      cr += crStep;  cg += cgStep;  cb += cbStep;			\
+      s0 += ds0;  t0 += dt0;						\
+      s1 += ds1;  t1 += dt1;						\
+      dest += 4;							\
+   }
+
+/* all four filter combinations for one BASE */
+#define DUALTEX_DECAL_BY_FILTER(BASE)					\
+   if (info->unit[0].linear) {						\
+      if (info->unit[1].linear) {					\
+         DUALTEX_LOOP_DECAL(DUALTEX_LINEAR, DUALTEX_LINEAR, BASE)	\
+      }									\
+      else {								\
+         DUALTEX_LOOP_DECAL(DUALTEX_LINEAR, DUALTEX_NEAREST, BASE)	\
+      }									\
+   }									\
+   else {								\
+      if (info->unit[1].linear) {					\
+         DUALTEX_LOOP_DECAL(DUALTEX_NEAREST, DUALTEX_LINEAR, BASE)	\
+      }									\
+      else {								\
+         DUALTEX_LOOP_DECAL(DUALTEX_NEAREST, DUALTEX_NEAREST, BASE)	\
+      }									\
+   }
+
+
 static void
 dualtex_span( GLcontext *ctx, struct sw_span *span,
               const struct dualtex_info *info )
@@ -1394,6 +1677,11 @@ dualtex_span( GLcontext *ctx, struct sw_span *span,
    const GLint shift = 8 - info->rgbShift;
    const GLfixed alphaStep = span->alphaStep;
    GLfixed alpha = span->alpha;
+   /* NOVA: the vertex colour, only used by decal mode with a modulating unit 0 */
+   const GLfixed crStep = span->redStep, cgStep = span->greenStep;
+   const GLfixed cbStep = span->blueStep;
+   GLfixed cr = span->red, cg = span->green, cb = span->blue;
+   const GLint mshift = 8 - info->mod0Shift;
    GLuint left = span->end;
    GLuint u;
 
@@ -1485,7 +1773,6 @@ dualtex_span( GLcontext *ctx, struct sw_span *span,
          const GLchan *data0 = (const GLchan *) img[0]->Data;
          const GLchan *data1 = (const GLchan *) img[1]->Data;
          const GLint comps0 = info->unit[0].comps;
-         const GLint comps1 = 3;
          const GLint wmask0 = img[0]->Width - 1,  hmask0 = img[0]->Height - 1;
          const GLint wmask1 = img[1]->Width - 1,  hmask1 = img[1]->Height - 1;
          const GLint wlog0 = img[0]->WidthLog2,   wlog1 = img[1]->WidthLog2;
@@ -1497,21 +1784,47 @@ dualtex_span( GLcontext *ctx, struct sw_span *span,
          GLfixed t1 = (tFix[1] >> level[1]) - half1;
          const GLfixed ds0 = sStep[0] >> level[0], dt0 = tStep[0] >> level[0];
          const GLfixed ds1 = sStep[1] >> level[1], dt1 = tStep[1] >> level[1];
-
-         if (info->unit[0].linear) {
-            if (info->unit[1].linear) {
-               DUALTEX_LOOP(DUALTEX_LINEAR, DUALTEX_LINEAR)
+         if (info->decal) {
+            const GLint comps1 = 4;
+            if (info->mod0Shift < 0) {
+               DUALTEX_DECAL_BY_FILTER(DUALTEX_BASE_REPLACE)
             }
             else {
-               DUALTEX_LOOP(DUALTEX_LINEAR, DUALTEX_NEAREST)
+               DUALTEX_DECAL_BY_FILTER(DUALTEX_BASE_MODULATE)
             }
          }
          else {
-            if (info->unit[1].linear) {
-               DUALTEX_LOOP(DUALTEX_NEAREST, DUALTEX_LINEAR)
+            const GLint comps1 = 3;
+            /* NOVA: unit 1 bilinear and magnified enough that a scanline stays
+             * in one texel for several pixels, see DUALTEX_LOOP_LMCELL
+             */
+            const GLboolean lmCell = (GLboolean)
+               (FIXED_SHIFT == 11      /* the products are sized for this */
+                && info->unit[1].linear
+                && ds1 >= -DUALTEX_LMCELL_MAXSTEP && ds1 <= DUALTEX_LMCELL_MAXSTEP
+                && dt1 >= -DUALTEX_LMCELL_MAXSTEP && dt1 <= DUALTEX_LMCELL_MAXSTEP);
+
+            if (info->unit[0].linear) {
+               if (lmCell) {
+                  DUALTEX_LOOP_LMCELL(DUALTEX_LINEAR)
+               }
+               else if (info->unit[1].linear) {
+                  DUALTEX_LOOP(DUALTEX_LINEAR, DUALTEX_LINEAR)
+               }
+               else {
+                  DUALTEX_LOOP(DUALTEX_LINEAR, DUALTEX_NEAREST)
+               }
             }
             else {
-               DUALTEX_LOOP(DUALTEX_NEAREST, DUALTEX_NEAREST)
+               if (lmCell) {
+                  DUALTEX_LOOP_LMCELL(DUALTEX_NEAREST)
+               }
+               else if (info->unit[1].linear) {
+                  DUALTEX_LOOP(DUALTEX_NEAREST, DUALTEX_LINEAR)
+               }
+               else {
+                  DUALTEX_LOOP(DUALTEX_NEAREST, DUALTEX_NEAREST)
+               }
             }
          }
       }
@@ -1534,6 +1847,12 @@ dualtex_span( GLcontext *ctx, struct sw_span *span,
 #undef DUALTEX_NEAREST
 #undef DUALTEX_LINEAR
 #undef DUALTEX_LOOP
+#undef DUALTEX_LOOP_LMCELL
+#undef DUALTEX_LOOP_DECAL
+#undef DUALTEX_DECAL_BY_FILTER
+#undef DUALTEX_BASE_REPLACE
+#undef DUALTEX_BASE_MODULATE
+#undef DUALTEX_LMCELL_CHAN
 
 
 /*
@@ -1803,7 +2122,12 @@ _swrast_choose_triangle( GLcontext *ctx )
 #endif
                  )
 	     && ctx->Light.Model.ColorControl == GL_SINGLE_COLOR
-	     && ctx->Texture.Unit[0].EnvMode != GL_COMBINE_EXT) {
+	     && (ctx->Texture.Unit[0].EnvMode != GL_COMBINE_EXT
+#if CHAN_BITS == 8
+                 /* NOVA: modulate with an RGB scale, see affine_envmode() */
+                 || combine_is_scaled_modulate(&ctx->Texture.Unit[0])
+#endif
+                 )) {
 	    if (ctx->Hint.PerspectiveCorrection==GL_FASTEST
                 && minFilter == magFilter) {
 	       if (minFilter == GL_NEAREST

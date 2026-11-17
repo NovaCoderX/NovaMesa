@@ -25,6 +25,7 @@ mkdir -p "$OBJ"
 for f in $SRC/*.c $SRC/swrast/*.c $SRC/swrast_setup/*.c $SRC/tnl/*.c $SRC/math/*.c $SRC/array_cache/*.c $SRC/amiga/*.c; do
   b=$(basename "$f" .c)
   case $b in m_debug_*) continue;; esac
+  rm -f "$OBJ/$b.o"   # so a file that fails to compile fails the link, instead of an old object being used
   $CC -c $FLAGS "$f" -o "$OBJ/$b.o" &
   while [ "$(jobs -r | wc -l)" -ge "$(nproc)" ]; do sleep 0.05; done
 done
