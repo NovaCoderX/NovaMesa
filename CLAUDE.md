@@ -64,17 +64,23 @@ Conditions shared by the single-texture fast paths: unit 0 only, 2D,
 `GL_REPEAT` both ways, no border, `MESA_FORMAT_RGB` or `RGBA`, env mode not
 `GL_COMBINE`, single colour (no separate specular).
 
-`dualtex_triangle` needs: unit 0 `GL_REPLACE` with an RGB or RGBA texture;
-unit 1 an RGB texture with `GL_MODULATE`, or `GL_COMBINE` set to
-MODULATE(PREVIOUS, TEXTURE) with RGB scale 1, 2 or 4; both `GL_REPEAT`, no
+`dualtex_triangle` needs either of these, with both textures `GL_REPEAT`, no
 border, filter NEAREST, LINEAR or the matching `*_MIPMAP_NEAREST`, default LOD
-bias and clamps.
+bias and clamps:
+
+- texture times lightmap: unit 0 `GL_REPLACE` with an RGB or RGBA texture;
+  unit 1 an RGB texture with `GL_MODULATE`, or `GL_COMBINE` set to
+  MODULATE(PREVIOUS, TEXTURE) with RGB scale 1, 2 or 4;
+- decal: unit 1 an RGBA texture with `GL_DECAL`; unit 0 `GL_REPLACE`,
+  `GL_MODULATE`, or `GL_COMBINE` set to TEXTURE * PRIMARY_COLOR with RGB scale
+  1, 2 or 4.
 
 Things that push an application onto the slow general path:
 
 - trilinear filtering (`*_MIPMAP_LINEAR`), or min and mag filters that disagree
 - `GL_COMBINE` on a single unit other than modulate with an RGB scale (fifth
-  round), three or more units, DECAL/ADD/BLEND on unit 1
+  round), three or more units, ADD/BLEND on unit 1, DECAL on unit 1 with an
+  RGB texture
 - wrap modes other than `GL_REPEAT`, texture borders, non-RGB/RGBA formats
 - blend functions other than the special-cased ones in
   `_swrast_choose_blend_func` (the rest use float `blend_general`)
@@ -138,6 +144,9 @@ On Ubuntu the cross tools are `gcc-m68k-linux-gnu` and `qemu-user-static`.
 
 Use it this way:
 
+- `build.sh` deletes each object before compiling it, so a source file that
+  fails to compile fails the link. (It used to link the previous object and
+  report success.)
 - The m68k build is big-endian and is the check that pixel packing and
   float-bit tricks are correct. Dump PPMs before and after a change and diff
   them. Behaviour-neutral changes should be byte-identical.
@@ -341,7 +350,22 @@ Done, measured on `timedemo demo1` at 320x240 (x86-32 instruction counts):
    texel here and there (0.5% of pixels differ, 0.05% by more than 8/255, all
    on the models). `bench` and `geom` are byte-identical.
 
-Together demo1 -12.2% (29.77 G -> 26.13 G); the first two alone were demo1
+5. **`GL_DECAL` on unit 1 in the dualtex path** (`info->decal`,
+   `DUALTEX_LOOP_DECAL`). Unit 1 must be an RGBA texture; unit 0 may be
+   `GL_REPLACE`, `GL_MODULATE`, or the scaled-modulate combine from item 4
+   (`info->mod0Shift`), in which case the vertex colour is interpolated in the
+   span. Any of the four nearest/linear combinations, mipmapped or not. The
+   arithmetic is the general path's (`CHAN_PRODUCT` for the decal). This takes
+   two FitzQuake cases off `multitextured_triangle`: alias models with a
+   fullbright mask (26.13 G -> 25.71 G on demo1, -1.6%; the view weapon -27%)
+   and the sky's two cloud layers (`Sky_DrawSky` -19%, a view that is half sky
+   -10%). About 0.1% of pixels differ from the general path, texel choice at
+   edges; `bench` and `geom` are byte-identical.
+   The sky is still dear for what it is: several hundred small quads a frame,
+   each paying dualtex's float setup, drawn with depth func GEQUAL so the
+   span reject does not apply.
+
+Together demo1 -13.6% (29.77 G -> 25.71 G); the first two alone were demo1
 -11.6%, demo2 -13.2%. Not run as m68k code this round: the
 cross compiler could not be installed in the session. Neither change depends
 on byte order (bytes and whole ARGB words only), but run the qemu check
@@ -355,15 +379,6 @@ Next candidates from the same profile, best first:
   `_mesa_span_interpolate_z`, `depth_test_span`, `_mesa_write_rgba_span` and
   the driver's `write_rgba_span`: about 13.5% of a frame. Needs a way for
   swrast to reach the driver's rows, like the blend hooks.
-- **`GL_DECAL` with an RGBA texture on unit 1 in the dualtex path** (Quake's
-  sky, depth func GEQUAL). It is on `multitextured_triangle` and a sky pixel
-  costs about 2.6 times a world pixel; the sky is 61% of an open view.
-- **Alias models with a fullbright mask** (unit 0 scaled-modulate combine,
-  unit 1 `GL_DECAL` with an RGBA texture, same texcoords, blend enabled but a
-  no-op) are still on `multitextured_triangle`: 6% of demo1, most of it the
-  view weapon. Having FitzQuake draw them in two passes instead (scaled
-  modulate, then the mask blended) was measured at only -0.3% on x86, so the
-  gain has to come from a two-unit integer path with a vertex colour.
 
 ## Ideas not done yet
 
@@ -373,8 +388,8 @@ Next candidates from the same profile, best first:
   first. Only worth it for an application that draws a lot of them; none of
   the known ones do.
 - **Wide lines** (`glLineWidth` > 1) go through the general path.
-- **Widen the dualtex path**: `GL_MODULATE` on unit 0, `GL_DECAL`/`GL_ADD` on
-  unit 1.
+- **Widen the dualtex path further**: `GL_MODULATE` on unit 0 with a
+  modulating unit 1, `GL_ADD` on unit 1. (`GL_DECAL` on unit 1 is done.)
 - **Clear and swap.** `glClear` copies a pre-filled buffer the size of the
   screen (8% of the 2D lines workload) and the swap copies it again; a fill
   loop and rendering in the screen's native format would cut memory traffic.
