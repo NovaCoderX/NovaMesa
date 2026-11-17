@@ -428,12 +428,18 @@ Useful as an example of how an application's state maps onto the paths above:
 - Its world pass is unit 0 REPLACE plus unit 1 lightmap, MODULATE or
   COMBINE x2 when `gl_overbright` is on — the dualtex case.
 - `gl_texturemode` 0, 1, 3 and 4 stay on fast paths; 2 and 5 are trilinear.
-- It sets `GL_PERSPECTIVE_CORRECTION_HINT` to `GL_FASTEST`, which selects the
-  affine path for non-mipmapped single textures and visibly warps large
-  polygons.
-- Sky is drawn flat and then again as two blended layers unless `r_fastsky 1`.
-- Alias models with `gl_overbright_models 1` use single-unit `GL_COMBINE`,
-  which is still on the general path.
+- It now sets `GL_PERSPECTIVE_CORRECTION_HINT` to `GL_NICEST` (it used to be
+  `GL_FASTEST`, which warped large non-mipmapped polygons for no measurable
+  gain, since the perspective front end already goes affine when it can).
+- Sky is drawn flat and then again as two cloud layers, unit 0 REPLACE plus
+  unit 1 DECAL with depth func GEQUAL (dualtex decal mode), unless
+  `r_fastsky 1`.
+- Alias models with `gl_overbright_models 1` use `GL_COMBINE` modulate x2:
+  alone (the scaled-modulate case on the single-texture paths), or with a
+  fullbright mask as a DECAL second unit (dualtex decal mode).
+- Its full-screen tints are one flat blended quad (the driver's flat blend
+  triangles).
+- Nothing it draws by default is on the general float paths any more.
 
 G-WARS, for contrast, uses only unblended 2D lines, points and a few quads
 with no depth test or textures (see the third round above).
