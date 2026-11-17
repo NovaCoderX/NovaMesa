@@ -244,6 +244,59 @@ static void write_rgba_span(const GLcontext* gl_ctx, GLuint n, GLint x, GLint y,
 }
 
 /*
+ * NOVA: depth test and write in one loop, for swrast's textured fast paths
+ * (see WriteRGBASpanDepth in swrast.h).  The depth values and the pixel
+ * conversion are exactly those of _mesa_span_interpolate_z(),
+ * depth_test_span16() and write_rgba_span() above.
+ */
+static GLint write_rgba_span_depth(const GLcontext* gl_ctx, GLuint n, GLint x, GLint y, const GLubyte rgba[][4], GLfixed z, GLfixed zStep) {
+	AMesaContext* a_ctx = (AMesaContext*) gl_ctx->DriverCtx;
+	GLuint* buffer;
+	GLushort* zRow;
+	const GLuint* src = (const GLuint*) rgba;
+	GLint passed = 0;
+	GLuint i;
+
+	if (gl_ctx->Visual.depthBits != DEFAULT_SOFTWARE_DEPTH_BITS
+			|| DEFAULT_SOFTWARE_DEPTH_BITS != 16
+			|| !gl_ctx->DrawBuffer->DepthBuffer
+			|| gl_ctx->Color._DrawDestMask != BACK_LEFT_BIT) {
+		return -1;
+	}
+
+	buffer = a_ctx->row[y] + x;
+	zRow = (GLushort*) gl_ctx->DrawBuffer->DepthBuffer + gl_ctx->DrawBuffer->Width * y + x;
+
+	if (gl_ctx->Depth.Func == GL_LESS) {
+		for (i = 0; i < n; i++) {
+			const GLdepth zv = (GLdepth) FixedToInt(z);
+			if (zv < (GLdepth) zRow[i]) {
+				const GLuint v = src[i];
+				zRow[i] = (GLushort) zv;
+				buffer[i] = RGBA_WORD_TO_ARGB32(v);
+				passed = 1;
+			}
+			z += zStep;
+		}
+	} else if (gl_ctx->Depth.Func == GL_LEQUAL) {
+		for (i = 0; i < n; i++) {
+			const GLdepth zv = (GLdepth) FixedToInt(z);
+			if (zv <= (GLdepth) zRow[i]) {
+				const GLuint v = src[i];
+				zRow[i] = (GLushort) zv;
+				buffer[i] = RGBA_WORD_TO_ARGB32(v);
+				passed = 1;
+			}
+			z += zStep;
+		}
+	} else {
+		return -1;
+	}
+
+	return passed;
+}
+
+/*
  * Write a horizontal span of pixels with a boolean mask.  The current color
  * is used for all pixels.
  */
@@ -1143,6 +1196,7 @@ static void amesa_display_init_pointers(GLcontext* gl_ctx) {
 
 	// NOVA: one-pass blending, see blend_rgba_span().
 	swdd->BlendRGBASpan = blend_rgba_span;
+	swdd->WriteRGBASpanDepth = write_rgba_span_depth;	// NOVA
 	swdd->BlendRGBAPixels = blend_rgba_pixels;
 
 	// Initialize the TNL driver interface...
