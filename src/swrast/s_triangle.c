@@ -1380,6 +1380,100 @@ dualtex_setup( const GLcontext *ctx, struct dualtex_info *info )
    }
 
 
+/*
+ * NOVA: one sub-span where unit 1 (an RGB texture) is bilinear and
+ * magnified.
+ *
+ * A lightmap has one texel per 16 texels of the surface texture, so on
+ * screen it is usually stretched over many pixels, and filtering it for
+ * every pixel (four fetches and nine lerps) was the largest single cost in
+ * the library for Quake-style scenes.
+ *
+ * While a scanline stays between the same four lightmap texels, the
+ * bilinear result is an exact quadratic in the pixel index:
+ *
+ *    f(k) = c00 + a.u + b.v + c.u.v,   u = u0 + k.du,  v = v0 + k.dv
+ *    a = c01 - c00,  b = c10 - c00,  c = c00 - c01 - c10 + c11
+ *
+ * so it can be stepped with a first and a second difference (two adds per
+ * channel) and only needs setting up again when the scanline moves on to
+ * another texel.  Nothing is approximated and no texel is read that the
+ * per-pixel filter would not read; the result differs from DUALTEX_LINEAR
+ * only in rounding, because that truncates after each of its three lerps.
+ *
+ * Light is kept in 16.16 with the "+ 1" of the modulate folded in.  With
+ * FIXED_SHIFT == 11 and steps of at most a quarter texel the products below
+ * stay inside 31 bits.
+ */
+#define DUALTEX_LMCELL_MAXSTEP (FIXED_ONE / 4)
+
+#define DUALTEX_LMCELL_CHAN(C, L, D, DD)				\
+   {									\
+      const GLint c00 = t00[C];						\
+      const GLint a = (GLint) t01[C] - c00;				\
+      const GLint b = (GLint) t10[C] - c00;				\
+      const GLint c = (GLint) t11[C] - (GLint) t10[C] - a;		\
+      const GLint cdd = (c * ds1 * dt1) >> (2 * FIXED_SHIFT - 16);	\
+      L = (c00 << 16) + 0x10000						\
+        + ((a * u0 + b * v0) << (16 - FIXED_SHIFT))			\
+        + ((((c * u0) >> 3) * v0) >> (2 * FIXED_SHIFT - 16 - 3));	\
+      D = ((a * ds1 + b * dt1) << (16 - FIXED_SHIFT))			\
+        + ((c * (u0 * dt1 + v0 * ds1)) >> (2 * FIXED_SHIFT - 16))	\
+        + cdd;								\
+      DD = 2 * cdd;							\
+   }
+
+#define DUALTEX_LOOP_LMCELL(FETCH0)					\
+   {									\
+      GLint lr = 0, lg = 0, lb = 0;					\
+      GLint dlr = 0, dlg = 0, dlb = 0;					\
+      GLint ddr = 0, ddg = 0, ddb = 0;					\
+      GLfixed cellS = s1 ^ FIXED_ONE, cellT = t1;  /* not this texel */	\
+      for (i = 0; i < n; i++) {						\
+         if (((s1 ^ cellS) | (t1 ^ cellT)) & ~FIXED_FRAC_MASK) {	\
+            /* a new texel: fetch its four corners, set up the steps */	\
+            const GLint col0 = FixedToInt(s1) & wmask1;			\
+            const GLint col1 = (col0 + 1) & wmask1;			\
+            const GLint row0 = (FixedToInt(t1) & hmask1) << wlog1;	\
+            const GLint row1 = ((FixedToInt(t1) + 1) & hmask1) << wlog1;\
+            const GLint u0 = s1 & FIXED_FRAC_MASK;			\
+            const GLint v0 = t1 & FIXED_FRAC_MASK;			\
+            const GLchan *t00 = data1 + 3 * (row0 + col0);		\
+            const GLchan *t01 = data1 + 3 * (row0 + col1);		\
+            const GLchan *t10 = data1 + 3 * (row1 + col0);		\
+            const GLchan *t11 = data1 + 3 * (row1 + col1);		\
+            DUALTEX_LMCELL_CHAN(0, lr, dlr, ddr)			\
+            DUALTEX_LMCELL_CHAN(1, lg, dlg, ddg)			\
+            DUALTEX_LMCELL_CHAN(2, lb, dlb, ddb)			\
+            cellS = s1;							\
+            cellT = t1;							\
+         }								\
+         {								\
+            FETCH0(0, tex0);						\
+            GLuint r = ((GLuint) tex0[0] * (GLuint) (lr >> 16)) >> shift;\
+            GLuint g = ((GLuint) tex0[1] * (GLuint) (lg >> 16)) >> shift;\
+            GLuint b = ((GLuint) tex0[2] * (GLuint) (lb >> 16)) >> shift;\
+            if (shift != 8) {						\
+               if (r > CHAN_MAX) r = CHAN_MAX;				\
+               if (g > CHAN_MAX) g = CHAN_MAX;				\
+               if (b > CHAN_MAX) b = CHAN_MAX;				\
+            }								\
+            dest[RCOMP] = (GLchan) r;					\
+            dest[GCOMP] = (GLchan) g;					\
+            dest[BCOMP] = (GLchan) b;					\
+            dest[ACOMP] = (comps0 == 4) ? tex0[3]			\
+                                        : (GLchan) FixedToInt(alpha);	\
+         }								\
+         alpha += alphaStep;						\
+         s0 += ds0;  t0 += dt0;						\
+         s1 += ds1;  t1 += dt1;						\
+         lr += dlr;  lg += dlg;  lb += dlb;				\
+         dlr += ddr;  dlg += ddg;  dlb += ddb;				\
+         dest += 4;							\
+      }									\
+   }
+
+
 static void
 dualtex_span( GLcontext *ctx, struct sw_span *span,
               const struct dualtex_info *info )
@@ -1497,9 +1591,20 @@ dualtex_span( GLcontext *ctx, struct sw_span *span,
          GLfixed t1 = (tFix[1] >> level[1]) - half1;
          const GLfixed ds0 = sStep[0] >> level[0], dt0 = tStep[0] >> level[0];
          const GLfixed ds1 = sStep[1] >> level[1], dt1 = tStep[1] >> level[1];
+         /* NOVA: unit 1 bilinear and magnified enough that a scanline stays
+          * in one texel for several pixels, see DUALTEX_LOOP_LMCELL
+          */
+         const GLboolean lmCell = (GLboolean)
+            (FIXED_SHIFT == 11      /* the products are sized for this */
+             && info->unit[1].linear
+             && ds1 >= -DUALTEX_LMCELL_MAXSTEP && ds1 <= DUALTEX_LMCELL_MAXSTEP
+             && dt1 >= -DUALTEX_LMCELL_MAXSTEP && dt1 <= DUALTEX_LMCELL_MAXSTEP);
 
          if (info->unit[0].linear) {
-            if (info->unit[1].linear) {
+            if (lmCell) {
+               DUALTEX_LOOP_LMCELL(DUALTEX_LINEAR)
+            }
+            else if (info->unit[1].linear) {
                DUALTEX_LOOP(DUALTEX_LINEAR, DUALTEX_LINEAR)
             }
             else {
@@ -1507,7 +1612,10 @@ dualtex_span( GLcontext *ctx, struct sw_span *span,
             }
          }
          else {
-            if (info->unit[1].linear) {
+            if (lmCell) {
+               DUALTEX_LOOP_LMCELL(DUALTEX_NEAREST)
+            }
+            else if (info->unit[1].linear) {
                DUALTEX_LOOP(DUALTEX_NEAREST, DUALTEX_LINEAR)
             }
             else {
@@ -1534,6 +1642,8 @@ dualtex_span( GLcontext *ctx, struct sw_span *span,
 #undef DUALTEX_NEAREST
 #undef DUALTEX_LINEAR
 #undef DUALTEX_LOOP
+#undef DUALTEX_LOOP_LMCELL
+#undef DUALTEX_LMCELL_CHAN
 
 
 /*
