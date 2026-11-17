@@ -57,7 +57,7 @@ whenever relevant state changes. Roughly, fastest to slowest:
 | `simple_textured_triangle`, `simple_z_textured_triangle` | one RGB texture, NEAREST, REPLACE/DECAL, `GL_FASTEST`, depth func LESS, nothing else enabled | integer, writes directly |
 | `affine_textured_triangle` | one RGB/RGBA texture, min filter == mag filter, `GL_FASTEST` | integer, no perspective correction |
 | `persp_textured_triangle` | as above with `GL_NICEST`, or filter is `*_MIPMAP_NEAREST` | integer, perspective divide every 16 pixels |
-| `dualtex_triangle` (NOVA) | exactly units 0 and 1, see below | integer, divide every 16 pixels |
+| `dualtex_triangle` (NOVA) | exactly units 0 and 1, see below | integer, divide every 16 pixels; a magnified bilinear unit 1 is stepped, not filtered per pixel |
 | `general_textured_triangle`, `multitextured_triangle` | everything else | float per pixel, texels via function pointers |
 
 Conditions shared by the single-texture fast paths: unit 0 only, 2D,
@@ -290,12 +290,72 @@ about 5% on smooth-shaded small triangles.
 immediate buffer, with no single expensive step. A few hundred binds a frame
 is well under 1% of a frame.
 
+## Fifth round: driven by a real FitzQuake profile
+
+FitzQuake now has a host harness (`FitzQuake/test/hostbench/`, see its
+`CLAUDE.md`) that builds the whole engine against this library and runs the
+shareware `timedemo`s under callgrind. That replaced guessing with a profile
+of a real application: 96.5% of a frame is in this library, 41% in one loop
+(`DUALTEX_LOOP(NEAREST, LINEAR)`, the bilinear lightmap), and the generic span
+code after it is another 13.5%. Use that harness as well as `bench` and `geom`
+for anything that touches the textured paths; it can hash every frame of a
+demo, which is a much stronger identity check than a few screenshots.
+
+Done, measured on `timedemo demo1` at 320x240 (x86-32 instruction counts):
+
+1. **Lightmap stepping in `dualtex_span`** (`DUALTEX_LOOP_LMCELL`). When unit 1
+   is bilinear and moves at most a quarter texel per pixel, the filter is not
+   evaluated per pixel. Between the same four texels the bilinear result is an
+   exact quadratic in the pixel index, so it is stepped with a first and a
+   second difference per channel and set up again only when the scanline
+   enters another texel. 29.77 G -> 27.08 G (-9.0%); corridor benchmark -15%.
+   Differs from the per-pixel filter only in rounding (that truncates after
+   each of three lerps): 13.6% of pixels by 1/255, 0.005% by 2, none by more
+   over 75 frames of three demos; `bench` up to 4 with x2 overbright on its
+   random lightmap. `geom` byte-identical.
+   Two approximate versions were tried first and rejected, do not go back to
+   them: filtering every 2/4/8 pixels and interpolating linearly was as fast
+   but went wrong by up to 25/255 where a dynamic light makes the lightmap
+   change sharply inside one texel; falling back to per-pixel whenever a run
+   crossed a texel fixed that and kept only 1.2% of the gain.
+   The products are sized for `FIXED_SHIFT == 11` and a step of at most a
+   quarter texel; the path is switched off for `FIXED_14`.
+2. **Direct flat blended triangles in the driver** (`flat_blend_*_triangle`,
+   chosen in `amesa_choose_triangle` when `_RasterMask == BLEND_BIT` and
+   shading is flat). Triangles above about 4000 pixels use four 256-entry
+   tables built by calling the blend function itself, kept until the colour
+   or mode changes. Quake's full-screen tint was about 100 instructions a
+   pixel. 27.08 G -> 26.33 G (-2.8%); byte-identical everywhere.
+3. `is_fan_like[]` in `tnl/t_imm_fixup.c` was indexed one to three entries
+   past its end outside `glBegin` (old Mesa bug, found with AddressSanitizer).
+
+Together demo1 -11.6%, demo2 -13.2%. Not run as m68k code this round: the
+cross compiler could not be installed in the session. Neither change depends
+on byte order (bytes and whole ARGB words only), but run the qemu check
+before relying on that.
+
+Next candidates from the same profile, best first:
+
+- **A dualtex variant that tests and writes Z and ARGB itself** for the plain
+  world state (depth LESS/LEQUAL with writes, no blend, alpha test, fog or
+  stencil). After texturing, every span still goes through
+  `_mesa_span_interpolate_z`, `depth_test_span`, `_mesa_write_rgba_span` and
+  the driver's `write_rgba_span`: about 13.5% of a frame. Needs a way for
+  swrast to reach the driver's rows, like the blend hooks.
+- **`GL_DECAL` with an RGBA texture on unit 1 in the dualtex path** (Quake's
+  sky, depth func GEQUAL). It is on `multitextured_triangle` and a sky pixel
+  costs about 2.6 times a world pixel; the sky is 61% of an open view.
+- **Single-unit `GL_COMBINE` modulate with RGB scale** (alias models with
+  overbright) is on `general_textured_triangle`. 1.4% on x86; more where
+  float is slow.
+
 ## Ideas not done yet
 
-- **Direct blended lines/points/triangles in the driver.** Blended untextured
-  primitives now blend in one pass but still go through swrast's generic
-  functions and span pipeline first. Only worth it for an application that
-  draws a lot of blended lines; none of the known ones do.
+- **Direct blended lines and points in the driver.** Flat blended triangles
+  are done (fifth round). Blended lines and points, and smooth shaded blended
+  triangles, still go through swrast's generic functions and span pipeline
+  first. Only worth it for an application that draws a lot of them; none of
+  the known ones do.
 - **Wide lines** (`glLineWidth` > 1) go through the general path.
 - **Widen the dualtex path**: `GL_MODULATE` on unit 0, `GL_DECAL`/`GL_ADD` on
   unit 1.
