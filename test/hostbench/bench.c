@@ -9,6 +9,15 @@
 #include <GL/glext.h>
 #include <GL/amiga_mesa.h>
 #include "amiga_mesa_def.h"
+#ifdef __m68k__
+/* under test/emu68model's harness: count the timed frames, per configuration */
+#include "model.h"
+#define MODEL_BEGIN()  model_begin()
+#define MODEL_END()    model_end("frames")
+#else
+#define MODEL_BEGIN()
+#define MODEL_END()
+#endif
 
 unsigned swap_sink;
 #ifdef DEBUG
@@ -225,9 +234,9 @@ int main(int argc, char **argv)
 			if (getenv("ONLY")) { int a,b,c; sscanf(getenv("ONLY"), "%d,%d,%d", &a,&b,&c); if (a!=hint||b!=filt||c!=mode) continue; }
 			glClearColor(0.15,0.15,0.15,0); glClear(GL_COLOR_BUFFER_BIT);
 			frame(mode, 0);
-			t0 = now();
+			t0 = now(); MODEL_BEGIN();
 			for (f = 0; f < frames; f++) { frame(mode, -20.0f + 40.0f * f / frames); amesa_swap_buffers(actx); }
-			t1 = now();
+			t1 = now(); MODEL_END();
 			printf("%-12s %-26s %-46s %9.2f  %s %s  [%08x]\n", hint ? "NICEST" : "FASTEST", fn[filt], mode_names[mode], (t1-t0)*1000/frames, trinames[0], trinames[1], checksum());
 			if (dumpprefix) { glClear(GL_COLOR_BUFFER_BIT); frame(mode, 12.0f); snprintf(nm, sizeof nm, "%s_h%d_f%d_m%d.ppm", dumpprefix, hint, filt, mode); dump(nm); }
 		}

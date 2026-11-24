@@ -4,6 +4,9 @@
 #
 #   ./build.sh                                   native build -> out/bench
 #   CC="m68k-linux-gnu-gcc -m68040" LDFLAGS=-static TAG=m68k ./build.sh
+#   CC="m68k-linux-gnu-gcc -m68060 -fno-optimize-sibling-calls" LDFLAGS=-static TAG=m060 ./build.sh
+#                                                then ../emu68model/work/harness out/bench_m060 ...
+#                                                (ms/frame are then modelled PiStorm times)
 #   CFLAGS=-DDEBUG TAG=debug ./build.sh          also prints the triangle function chosen
 #
 # Two programs are built:
@@ -20,7 +23,7 @@ SRC=$HERE/../../src
 CC=${CC:-gcc}
 TAG=${TAG:-host}
 OBJ=$HERE/out/obj_$TAG
-FLAGS="-O2 -fno-strict-aliasing -w -std=gnu99 $CFLAGS -include $HERE/stub/libraries/Picasso96.h -I$HERE/stub -I$SRC -I$SRC/amiga"
+FLAGS="-O2 -fno-strict-aliasing -w -std=gnu99 $CFLAGS -include $HERE/stub/libraries/Picasso96.h -I$HERE/stub -I$SRC -I$SRC/amiga -I$HERE/../emu68model"
 mkdir -p "$OBJ"
 for f in $SRC/*.c $SRC/swrast/*.c $SRC/swrast_setup/*.c $SRC/tnl/*.c $SRC/math/*.c $SRC/array_cache/*.c $SRC/amiga/*.c; do
   b=$(basename "$f" .c)
