@@ -25,7 +25,9 @@ the repo) using:
 - **C first, assembler only on evidence.** On Emu68 the 68k code is translated
   to ARM, and the 68k FPU has no SIMD, so hand-written 68k assembly rarely
   beats gcc -O2. Only consider it for one specific loop that a profile shows is
-  hot *and* whose gcc output is clearly poor.
+  hot *and* whose gcc output is clearly poor. Look first for branches Emu68
+  guesses wrong: each costs about as much as 40 instructions, and they are
+  usually fixable in C (sixth round, `test/emu68model/`).
 - Changes are marked with a `NOVA:` comment explaining why, matching the
   existing convention.
 - Line endings are mixed. `src/amiga/amiga_mesa_display.c` is CRLF, most of
@@ -46,6 +48,10 @@ the repo) using:
 - `src/tnl/`, `src/math/`, `src/array_cache/`, `src/swrast_setup/` — vertex
   pipeline: immediate mode, transform, clip, and building rasteriser vertices.
 - `test/hostbench/` — host/qemu benchmark, see below.
+- `test/emu68model/` — Musashi with a model of Emu68's JIT: runs the m68k
+  builds of the benchmarks and of FitzQuake and counts instructions and
+  wrongly guessed branches, per function and per source line. See its
+  `README.md` and the sixth round below.
 
 ## How rendering paths are chosen
 
@@ -117,8 +123,10 @@ cost; Emu68 should land between those two ratios. The owner measured
 FitzQuake `timedemo` in FS-UAE going from about 10 to 26.3 FPS with this
 round; nothing has been measured on a real PiStorm yet.
 
-Known visual differences from stock: the subdivided paths differ slightly on
-steeply angled surfaces and at mip boundaries; bilinear in the dualtex path
+Known visual differences from stock: the subdivided perspective paths place
+texels within a quarter of a pixel of the exact position (sixth round; it was
+up to several pixels on surfaces seen close up at a glancing angle) and can
+pick another mip level at sub-span boundaries; bilinear in the dualtex path
 uses 8-bit weights; the new blend differs by at most 2/255.
 
 Only `GL_REPLACE` on unit 0 has been exercised by the benchmark. Other env
@@ -398,6 +406,79 @@ loops and their per-16-pixel setup), its triangle setup 10%,
   their `q` is the same (it nearly always is).
 - The sky: several hundred small quads a frame, see item 5.
 
+## Sixth round: texture swimming, and a model of Emu68
+
+**Texture swimming (fixed).** The owner saw textures warp in FitzQuake. The
+cause was the perspective subdivision in `dualtex_span` and
+`fast_persp_span`: texture coordinates were exact every 16 pixels and linear
+in between. Within a run of n pixels where q changes by the ratio r, that
+misplaces texels by up to about n (r - 1) / 4 pixels. Instrumenting demo1-3:
+9-12% of world pixels were in runs off by half a pixel or more, 1-2% by a
+pixel or more, a few by 4 pixels, all on surfaces close up at a glancing
+angle; and the error moves as the view moves.
+
+`persp_run_shift()` now picks the run length per sub-span: 16 where the error
+stays under a quarter of a pixel, halved until it does elsewhere (halving
+quarters the error). `PERSP_MAX_ERROR_K` sets the bound (1.0 = a quarter of
+a pixel; 0.5 = half; 0 = the old fixed runs, for comparing builds). The
+whole-triangle affine test for small/2D triangles (`triangle_is_near_affine`)
+uses the same bound; it was half a pixel. Cost, demo1: x86 instructions +3.0%
+(23.93 G -> 24.64 G), in the Emu68 model +3.0% on the frames measured; a
+half-pixel bound would cost +0.3%. Against Mesa's exact per-pixel path the
+share of pixels differing at all falls from 9.3% to 5.7% (the rest is
+lightmap rounding and texel choice on models).
+
+Gotcha: estimate q over the run that is actually drawn (at most `left`
+pixels), not 16 pixels ahead. Past the end of a span q can be tiny or
+negative, which split runs for nothing and made a build with the bound
+switched off differ from the old one.
+
+**A model of Emu68 (`test/emu68model/`).** From AmiDuke's image enhancer
+work (V-WARS' softbench): Musashi runs the m68k build and a model of
+Emu68's translation counts *dispatches*, branches the JIT guesses wrong
+(a backward branch within 256 bytes is guessed taken, anything else not
+taken) plus calls through pointers. Fitted on the PiStorm: 0.64 ns an
+instruction, 25 ns a dispatch. It runs NovaMesa's `bench` and `geom` and the
+whole of FitzQuake (`MODEL=1` in its `run.sh`), byte for byte as qemu-m68k
+renders them, about 30 M instructions a second. Musashi's FPU needed three
+fixes for gcc's 68060 code and glibc's libm (`musashi_fpu.py`).
+
+What it showed that x86 profiles cannot: in FitzQuake's world loop
+(`DUALTEX_LOOP_LMCELL`, the stepped lightmap) dispatches cost more than the
+instructions. Per pixel, three `if (x > 255) x = 255` clamps (a forward
+branch skipping the store, nearly always taken, so guessed wrong every
+time), and a loop body of 914 bytes whose branch back was out of reach:
+about five wrong guesses a pixel, some 125 ns of a modelled ~200.
+
+Done, all byte-identical (every frame of demo1 on x86 and the first 200 as
+m68k code; `bench` and `geom` hashes):
+
+1. Clamps to 255 in the dualtex loops are a 1 KB table
+   (`nova_clamp255`, products are at most 1020).
+2. The new-lightmap-texel set-up is `NOVA_UNLIKELY` (`__builtin_expect`):
+   gcc moves it out of the loop, which now fits in 256 bytes and is laid
+   out with the texel test as the branch back.
+3. A second copy of the LMCELL loop for Quake's state (RGB texture,
+   constant alpha, overbright x2) with those as constants: no `muls` by
+   `comps0`, alpha hoisted, fewer spills.
+
+Modelled time for FitzQuake demo1 frames 100-200: 3819 ms -> 3044 (1 and 2)
+-> 2964 (3) -> 3053 with the quarter-pixel subdivision, -20% overall. Whole
+demo1 in the model: 31.59 s -> 25.26 s (-20%), 32.6 -> 26.1 ms a frame,
+wrong guesses 721 M -> 473 M, the quarter-pixel subdivision included. On x86 the branch work is -1.1% instructions
+(it is not about instructions).
+
+What the model says is left (`pclines.py`): the LMCELL loop line is still a
+quarter of the frame, about 58 instructions a pixel with spills plus about
+200 per new lightmap texel; then per-span and per-sub-span branches
+(`s_tritemp.h`'s loops over all texture units, the mip level search,
+`span_hidden`). See "Ideas not done yet".
+
+**Not yet checked on a PiStorm.** The model's ranking of these variants is
+what needs confirming: FitzQuake `timedemo demo1` on the PiStorm before and
+after this round. If the model holds, the lightmap loop in assembler is the
+next big step.
+
 ## Ideas not done yet
 
 - **Direct blended lines and points in the driver.** Flat blended triangles
@@ -408,13 +489,28 @@ loops and their per-16-pixel setup), its triangle setup 10%,
 - **Wide lines** (`glLineWidth` > 1) go through the general path.
 - **Widen the dualtex path further**: `GL_MODULATE` on unit 0 with a
   modulating unit 1, `GL_ADD` on unit 1. (`GL_DECAL` on unit 1 is done.)
-- **Clear and swap.** `glClear` copies a pre-filled buffer the size of the
-  screen (8% of the 2D lines workload) and the swap copies it again; a fill
-  loop and rendering in the screen's native format would cut memory traffic.
-  Needs measuring on real hardware, not here.
+- **Hand-written 68k for the lightmap loop** (`DUALTEX_LOOP_LMCELL`), now
+  that there is evidence for it: in the model its gcc output is about 58
+  instructions a pixel with many spills, plus about 200 for each new
+  lightmap texel (one pixel in five), and that is a quarter of a FitzQuake
+  frame. AmiDuke's image enhancer went from 149 to 56 instructions a pixel
+  this way. Check the model against the PiStorm first (sixth round).
+- **Per-span and per-sub-span branches** that the model shows dispatching:
+  the multitexture loops in `s_tritemp.h` run over all `MaxTextureUnits` and
+  test each unit (lines 1186, 1322, 1375: two or three wrong guesses per
+  scanline); the mip level search in `dualtex_span`; `span_hidden`;
+  `write_textured_span`'s call through a pointer.
 
 Other ideas noted but deliberately left alone:
 
+- **Clear and swap** (measured in the sixth round, not worth it). FitzQuake
+  never clears the colour buffer (`gl_clear 0`); its depth clear is a
+  `memset`, 0.4% of a frame in the model. Where the colour buffer is
+  cleared (`geom`), the `CopyMemQuick` of a 320x240 buffer is about 0.08 ms
+  modelled against frames of 15 ms and more; a fill loop would save half of
+  that. The swap (`p96WritePixelArray`) cannot be measured off the machine:
+  if it ever matters, time `timedemo` on the PiStorm with the call taken
+  out, and only then think about rendering in the screen's format.
 - Direct-to-buffer writes for the *textured* paths from inside the texturing
   loops. The fifth round did the cheap half of this (one combined depth and
   write loop after texturing, for the plain state only).
