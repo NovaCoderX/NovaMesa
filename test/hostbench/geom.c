@@ -10,6 +10,15 @@
 #include <GL/glext.h>
 #include <GL/amiga_mesa.h>
 #include "amiga_mesa_def.h"
+#ifdef __m68k__
+/* under test/emu68model's harness: count the timed frames, per configuration */
+#include "model.h"
+#define MODEL_BEGIN()  model_begin()
+#define MODEL_END()    model_end("frames")
+#else
+#define MODEL_BEGIN()
+#define MODEL_END()
+#endif
 
 unsigned swap_sink;
 #ifdef DEBUG
@@ -362,14 +371,14 @@ int main(int argc, char **argv)
 		if (getenv("ONLY") && atoi(getenv("ONLY")) != w) continue;
 		reset_state(); glClearColor(0, 0, 0, 0);
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT); work[w].fn(0); glFlush();
-		t0 = now();
+		t0 = now(); MODEL_BEGIN();
 		for (f = 0; f < frames; f++) {
 			reset_state();
 			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 			work[w].fn(f * 0.05f); glFlush();
 			amesa_swap_buffers(actx);
 		}
-		t1 = now();
+		t1 = now(); MODEL_END();
 		printf("%-40s %9.2f  %s [%08x]\n", work[w].name, (t1-t0)*1000/frames, TRINAME, checksum());
 		if (dumpprefix) { reset_state(); glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT); work[w].fn(0.3f); glFlush(); snprintf(nm, sizeof nm, "%s_w%d.ppm", dumpprefix, w); dump(nm); }
 	}

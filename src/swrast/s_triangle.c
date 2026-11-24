@@ -386,6 +386,17 @@ write_textured_span( GLcontext *ctx, struct sw_span *span, GLboolean direct )
 
 
 /*
+ * NOVA: the largest error, in pixels, that the perspective paths accept from
+ * interpolating texture coordinates linearly, as 1 / (4 * error): 1.0 is a
+ * quarter of a pixel.  See persp_run_shift().  0 turns the bound off, which
+ * gives the fixed 16-pixel runs of before (for comparing builds only).
+ */
+#ifndef PERSP_MAX_ERROR_K
+#define PERSP_MAX_ERROR_K  1.0F   /* 1 / (4 * largest error in pixels) */
+#endif
+
+
+/*
  * NOVA: is perspective correction worth doing for this triangle?
  *
  * It only matters when 1/w differs noticeably between the vertices.  For
@@ -422,8 +433,14 @@ triangle_is_near_affine( const SWvertex *v0, const SWvertex *v1,
       extent = MAX2(extent, ay);
       extent = MAX2(extent, by);
       extent = MAX2(extent, cy);
-      /* (wMax/wMin - 1) * extent / 4 < 0.5 pixel */
-      return (GLboolean) ((wMax - wMin) * extent < 2.0F * wMin);
+      /* (wMax/wMin - 1) * extent / 4 under the error persp_run_shift()
+       * allows the subdivided spans (NOVA: it was half a pixel, which let
+       * two triangles of a quad disagree by a pixel along their diagonal);
+       * never more than half a pixel
+       */
+      return (GLboolean) ((wMax - wMin) * extent
+                          * ((PERSP_MAX_ERROR_K > 0.5F) ? PERSP_MAX_ERROR_K : 0.5F)
+                          < wMin);
    }
 }
 
@@ -901,6 +918,51 @@ static void affine_textured_triangle( GLcontext *ctx,
 #define PERSP_SUBDIV       16
 #define PERSP_SUBDIV_SHIFT 4
 
+/*
+ * NOVA: how many pixels to interpolate linearly between two perspective
+ * divides, as a shift.
+ *
+ * Over a run of n pixels in which q goes from q0 to q1, linear interpolation
+ * between the exact end points misplaces texels by up to about
+ * n * (q1/q0 - 1) / 4 pixels, in the middle of the run.  Runs are
+ * PERSP_SUBDIV pixels long wherever that is within the error set by
+ * PERSP_MAX_ERROR_K (a quarter of a pixel), and halved until it is
+ * elsewhere: in practice walls
+ * close up and at a glancing angle.  With fixed 16-pixel runs those were off
+ * by up to several pixels, and since the error moves with the view, the
+ * texture visibly swam.  Halving n quarters the error, so few runs need more
+ * than one halving.  q is assumed positive (the triangle has been clipped);
+ * if it is near zero the runs simply become single pixels.
+ */
+
+#ifdef __GNUC__
+#define NOVA_UNLIKELY(x)  __builtin_expect(!!(x), 0)   /* see DUALTEX_LERP */
+#else
+#define NOVA_UNLIKELY(x)  (x)
+#endif
+
+static INLINE GLuint
+persp_run_shift( GLfloat q, GLfloat qStep, GLuint left )
+{
+   /* q over the run, not beyond the end of the span: past it q may be small
+    * or negative, and that would split runs for nothing.  The smallest q is
+    * q + min(0, qStep * len), worked out without a branch.
+    */
+   const GLuint len = (left < PERSP_SUBDIV) ? left : PERSP_SUBDIV;
+   const GLfloat a = FABSF(qStep);
+   const GLfloat qMin = q + (qStep - a) * (0.5F * (GLfloat) len);
+   /* error ~ n * n * |qStep| / (4 * qMin) */
+   GLfloat e = a * ((GLfloat) (PERSP_SUBDIV * PERSP_SUBDIV) * PERSP_MAX_ERROR_K);
+   GLuint shift = PERSP_SUBDIV_SHIFT;
+   if (NOVA_UNLIKELY(e > qMin)) {
+      do {
+         shift--;
+         e *= 0.25F;
+      } while (shift > 0 && e > qMin);
+   }
+   return shift;
+}
+
 static INLINE void
 fast_persp_span(GLcontext *ctx, struct sw_span *span,
 		const struct affine_info *base)
@@ -941,8 +1003,10 @@ fast_persp_span(GLcontext *ctx, struct sw_span *span,
        * polygon facing the viewer) the mapping is already linear, so the
        * whole span can be done in one run.
        */
-      const GLuint n = (left > PERSP_SUBDIV && hqStep != 0.0F)
-                     ? PERSP_SUBDIV : left;
+      /* NOVA: shorter runs where perspective is strong, see persp_run_shift */
+      const GLuint runShift = persp_run_shift(hq, hqStep, left);
+      const GLuint n = (left > (1u << runShift) && hqStep != 0.0F)
+                     ? (1u << runShift) : left;
       GLfixed sEnd, tEnd, sStep, tStep;
       GLint level = 0;
 
@@ -986,9 +1050,9 @@ fast_persp_span(GLcontext *ctx, struct sw_span *span,
       tTex = ht * invQ;
       sEnd = (GLfixed) ((sTex - sBias) * FIXED_SCALE);
       tEnd = (GLfixed) ((tTex - tBias) * FIXED_SCALE);
-      if (n == PERSP_SUBDIV) {
-         sStep = (sEnd - sFix) >> PERSP_SUBDIV_SHIFT;
-         tStep = (tEnd - tFix) >> PERSP_SUBDIV_SHIFT;
+      if (n == (1u << runShift)) {
+         sStep = (sEnd - sFix) >> runShift;
+         tStep = (tEnd - tFix) >> runShift;
       }
       else {
          sStep = (sEnd - sFix) / (GLint) n;
@@ -1269,7 +1333,8 @@ static void persp_textured_triangle( GLcontext *ctx,
  * both GL_REPEAT, no border, filtered GL_NEAREST, GL_LINEAR or the matching
  * *_MIPMAP_NEAREST mode.  Anything else still takes the general path.
  *
- * Texture coordinates are perspective-divided every DUALTEX_SUBDIV pixels and
+ * Texture coordinates are perspective-divided every PERSP_SUBDIV pixels, or
+ * more often where that would misplace texels (see persp_run_shift), and
  * interpolated linearly in fixed point in between (the same trick Quake's own
  * software renderer uses), so the per-pixel work is integer only.  The mipmap
  * level is likewise chosen once per sub-span rather than per pixel.
@@ -1277,9 +1342,6 @@ static void persp_textured_triangle( GLcontext *ctx,
  * Fog, alpha test, depth test, blending and masking are still done by
  * _mesa_write_rgba_span(), so those all keep working.
  */
-
-#define DUALTEX_SUBDIV       16
-#define DUALTEX_SUBDIV_SHIFT 4
 
 struct dualtex_unit
 {
@@ -1480,6 +1542,38 @@ dualtex_setup( const GLcontext *ctx, struct dualtex_info *info )
 }
 
 
+/*
+ * NOVA: branches in the per-pixel loops, and the PiStorm.
+ *
+ * Emu68 translates 68k code in blocks and guesses each conditional branch
+ * statically: taken if it jumps backward by less than 256 bytes, otherwise
+ * not taken.  Every wrong guess leaves the translated block and goes back
+ * through Emu68's dispatcher, which costs about as much as 40 ordinary
+ * instructions (test/emu68model/ has the measurements).  So in these loops:
+ *
+ *  - a clamp to 255 is a table lookup, not "if (x > 255) x = 255": that
+ *    skips forward over the store almost every time, a wrong guess per
+ *    channel per pixel;
+ *  - work done only now and then (a new lightmap texel) is marked unlikely,
+ *    so gcc moves it out of the loop, the common case falls through, and
+ *    the loop stays short enough for its branch back to be guessed right.
+ *
+ * Neither changes any result.
+ */
+/* x in [0, 1023] clamped to [0, 255] */
+#define NOVA_CL4(n)    (n), (n) + 1, (n) + 2, (n) + 3
+#define NOVA_CL16(n)   NOVA_CL4(n), NOVA_CL4((n) + 4), NOVA_CL4((n) + 8), NOVA_CL4((n) + 12)
+#define NOVA_CL64(n)   NOVA_CL16(n), NOVA_CL16((n) + 16), NOVA_CL16((n) + 32), NOVA_CL16((n) + 48)
+#define NOVA_SAT16     255, 255, 255, 255, 255, 255, 255, 255, \
+                       255, 255, 255, 255, 255, 255, 255, 255
+#define NOVA_SAT128    NOVA_SAT16, NOVA_SAT16, NOVA_SAT16, NOVA_SAT16, \
+                       NOVA_SAT16, NOVA_SAT16, NOVA_SAT16, NOVA_SAT16
+static const GLubyte nova_clamp255[1024] = {
+   NOVA_CL64(0), NOVA_CL64(64), NOVA_CL64(128), NOVA_CL64(192),
+   NOVA_SAT128, NOVA_SAT128, NOVA_SAT128, NOVA_SAT128, NOVA_SAT128, NOVA_SAT128
+};
+#define NOVA_CLAMP255(x)  nova_clamp255[x]
+
 /* a + (b - a) * f, with f in [0,255] */
 #define DUALTEX_LERP(a, b, f) \
    ((GLint) (a) + ((((GLint) (b) - (GLint) (a)) * (f)) >> 8))
@@ -1526,17 +1620,13 @@ dualtex_setup( const GLcontext *ctx, struct dualtex_info *info )
    for (i = 0; i < n; i++) {						\
       FETCH0(0, tex0);							\
       FETCH1(1, tex1);							\
-      GLuint r = ((GLuint) tex0[0] * ((GLuint) tex1[0] + 1)) >> shift;	\
-      GLuint g = ((GLuint) tex0[1] * ((GLuint) tex1[1] + 1)) >> shift;	\
-      GLuint b = ((GLuint) tex0[2] * ((GLuint) tex1[2] + 1)) >> shift;	\
-      if (shift != 8) {							\
-         if (r > CHAN_MAX) r = CHAN_MAX;				\
-         if (g > CHAN_MAX) g = CHAN_MAX;				\
-         if (b > CHAN_MAX) b = CHAN_MAX;				\
-      }									\
-      dest[RCOMP] = (GLchan) r;						\
-      dest[GCOMP] = (GLchan) g;						\
-      dest[BCOMP] = (GLchan) b;						\
+      /* NOVA: at most 1020 (shift >= 6); clamped by table */		\
+      const GLuint r = ((GLuint) tex0[0] * ((GLuint) tex1[0] + 1)) >> shift;\
+      const GLuint g = ((GLuint) tex0[1] * ((GLuint) tex1[1] + 1)) >> shift;\
+      const GLuint b = ((GLuint) tex0[2] * ((GLuint) tex1[2] + 1)) >> shift;\
+      dest[RCOMP] = NOVA_CLAMP255(r);					\
+      dest[GCOMP] = NOVA_CLAMP255(g);					\
+      dest[BCOMP] = NOVA_CLAMP255(b);					\
       dest[ACOMP] = (comps0 == 4) ? tex0[3]				\
                                   : (GLchan) FixedToInt(alpha);		\
       alpha += alphaStep;						\
@@ -1596,7 +1686,8 @@ dualtex_setup( const GLcontext *ctx, struct dualtex_info *info )
       GLint ddr = 0, ddg = 0, ddb = 0;					\
       GLfixed cellS = s1 ^ FIXED_ONE, cellT = t1;  /* not this texel */	\
       for (i = 0; i < n; i++) {						\
-         if (((s1 ^ cellS) | (t1 ^ cellT)) & ~FIXED_FRAC_MASK) {	\
+         if (NOVA_UNLIKELY(((s1 ^ cellS) | (t1 ^ cellT))		\
+                           & ~FIXED_FRAC_MASK)) {			\
             /* a new texel: fetch its four corners, set up the steps */	\
             const GLint col0 = FixedToInt(s1) & wmask1;			\
             const GLint col1 = (col0 + 1) & wmask1;			\
@@ -1616,17 +1707,13 @@ dualtex_setup( const GLcontext *ctx, struct dualtex_info *info )
          }								\
          {								\
             FETCH0(0, tex0);						\
-            GLuint r = ((GLuint) tex0[0] * (GLuint) (lr >> 16)) >> shift;\
-            GLuint g = ((GLuint) tex0[1] * (GLuint) (lg >> 16)) >> shift;\
-            GLuint b = ((GLuint) tex0[2] * (GLuint) (lb >> 16)) >> shift;\
-            if (shift != 8) {						\
-               if (r > CHAN_MAX) r = CHAN_MAX;				\
-               if (g > CHAN_MAX) g = CHAN_MAX;				\
-               if (b > CHAN_MAX) b = CHAN_MAX;				\
-            }								\
-            dest[RCOMP] = (GLchan) r;					\
-            dest[GCOMP] = (GLchan) g;					\
-            dest[BCOMP] = (GLchan) b;					\
+            /* NOVA: light is 1..256, so at most 1020; see above */	\
+            const GLuint r = ((GLuint) tex0[0] * (GLuint) (lr >> 16)) >> shift;\
+            const GLuint g = ((GLuint) tex0[1] * (GLuint) (lg >> 16)) >> shift;\
+            const GLuint b = ((GLuint) tex0[2] * (GLuint) (lb >> 16)) >> shift;\
+            dest[RCOMP] = NOVA_CLAMP255(r);				\
+            dest[GCOMP] = NOVA_CLAMP255(g);				\
+            dest[BCOMP] = NOVA_CLAMP255(b);				\
             dest[ACOMP] = (comps0 == 4) ? tex0[3]			\
                                         : (GLchan) FixedToInt(alpha);	\
          }								\
@@ -1656,15 +1743,15 @@ dualtex_setup( const GLcontext *ctx, struct dualtex_info *info )
    const GLuint a = (comps0 == 4) ? tex0[3] : (GLuint) FixedToInt(alpha);
 
 #define DUALTEX_BASE_MODULATE						\
-   GLuint r = ((GLuint) tex0[0] * ((GLuint) FixedToInt(cr) + 1)) >> mshift;\
-   GLuint g = ((GLuint) tex0[1] * ((GLuint) FixedToInt(cg) + 1)) >> mshift;\
-   GLuint b = ((GLuint) tex0[2] * ((GLuint) FixedToInt(cb) + 1)) >> mshift;\
+   const GLuint r = NOVA_CLAMP255(((GLuint) tex0[0]			\
+                       * ((GLuint) FixedToInt(cr) + 1)) >> mshift);	\
+   const GLuint g = NOVA_CLAMP255(((GLuint) tex0[1]			\
+                       * ((GLuint) FixedToInt(cg) + 1)) >> mshift);	\
+   const GLuint b = NOVA_CLAMP255(((GLuint) tex0[2]			\
+                       * ((GLuint) FixedToInt(cb) + 1)) >> mshift);	\
    const GLuint a = (comps0 == 4)					\
       ? ((GLuint) tex0[3] * ((GLuint) FixedToInt(alpha) + 1)) >> 8	\
-      : (GLuint) FixedToInt(alpha);					\
-   if (r > CHAN_MAX) r = CHAN_MAX;					\
-   if (g > CHAN_MAX) g = CHAN_MAX;					\
-   if (b > CHAN_MAX) b = CHAN_MAX;
+      : (GLuint) FixedToInt(alpha);
 
 #define DUALTEX_LOOP_DECAL(FETCH0, FETCH1, BASE)			\
    for (i = 0; i < n; i++) {						\
@@ -1754,11 +1841,22 @@ dualtex_span( GLcontext *ctx, struct sw_span *span,
    }
 
    while (left > 0) {
-      const GLuint n = (left > DUALTEX_SUBDIV) ? DUALTEX_SUBDIV : left;
+      /* NOVA: shorter runs where perspective is strong, see persp_run_shift.
+       * The two units nearly always share q; if not, the shorter run wins.
+       */
+      GLuint runShift = persp_run_shift(hq[0], hqStep[0], left);
+      GLuint n;
       const struct gl_texture_image *img[2];
       GLint level[2];
       GLfixed sStep[2], tStep[2];
       GLuint i;
+
+      if (hq[1] != hq[0] || hqStep[1] != hqStep[0]) {
+         const GLuint shift1 = persp_run_shift(hq[1], hqStep[1], left);
+         if (shift1 < runShift)
+            runShift = shift1;
+      }
+      n = (left > (1u << runShift)) ? (1u << runShift) : left;
 
       for (u = 0; u < 2; u++) {
          const struct dualtex_unit *du = &info->unit[u];
@@ -1797,9 +1895,9 @@ dualtex_span( GLcontext *ctx, struct sw_span *span,
          sEnd = (GLfixed) ((sTex[u] - sBias[u]) * FIXED_SCALE);
          tEnd = (GLfixed) ((tTex[u] - tBias[u]) * FIXED_SCALE);
 
-         if (n == DUALTEX_SUBDIV) {
-            sStep[u] = (sEnd - sFix[u]) >> DUALTEX_SUBDIV_SHIFT;
-            tStep[u] = (tEnd - tFix[u]) >> DUALTEX_SUBDIV_SHIFT;
+         if (n == (1u << runShift)) {
+            sStep[u] = (sEnd - sFix[u]) >> runShift;
+            tStep[u] = (tEnd - tFix[u]) >> runShift;
          }
          else {
             sStep[u] = (sEnd - sFix[u]) / (GLint) n;
@@ -1858,7 +1956,18 @@ dualtex_span( GLcontext *ctx, struct sw_span *span,
                }
             }
             else {
-               if (lmCell) {
+               if (lmCell && comps0 == 3 && alphaStep == 0 && shift == 7) {
+                  /* NOVA: Quake's world with overbright lightmaps, with the
+                   * state as constants: no multiply by comps0, alpha
+                   * hoisted out, fewer live variables and so fewer spills.
+                   * Same code, same results; see test/emu68model.
+                   */
+                  const GLint comps0 = 3;
+                  const GLfixed alphaStep = 0;
+                  const GLint shift = 7;
+                  DUALTEX_LOOP_LMCELL(DUALTEX_NEAREST)
+               }
+               else if (lmCell) {
                   DUALTEX_LOOP_LMCELL(DUALTEX_NEAREST)
                }
                else if (info->unit[1].linear) {
